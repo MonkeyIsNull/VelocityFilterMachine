@@ -1,0 +1,43 @@
+; Connection Rate Limiting Filter
+; Limit new connections per source IP
+
+; Check for IPv4
+LD16 12         ; EtherType
+PUSH 0x0800     ; IPv4
+JNE accept
+
+; Check for TCP
+LD8 23          ; IP Protocol
+PUSH 6          ; TCP
+JNE accept
+
+; Check for SYN flag (new connection)
+LD8 47          ; TCP Flags
+PUSH 0x02       ; SYN flag
+AND
+PUSH 0x02
+JNE accept      ; Not a SYN packet, accept
+
+; Rate limit by source IP
+LD32 26         ; Source IP
+HASH5           ; Hash for flow table
+DUP
+
+; Load current connection count
+FLOW_LOAD
+PUSH 1
+ADD
+DUP
+FLOW_STORE      ; Store incremented count
+
+; Check if over limit (10 connections/sec)
+PUSH 10
+JGT drop
+
+accept:
+    PUSH 1      ; Accept packet
+    RET
+
+drop:
+    PUSH 0      ; Drop packet
+    RET

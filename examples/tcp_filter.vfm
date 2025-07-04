@@ -1,0 +1,37 @@
+LD16 12         ; EtherType
+PUSH 0x0800     ; IPv4
+JNE accept
+
+LD8 23          ; IP Protocol
+PUSH 6          ; TCP
+JNE accept
+
+LD8 47          ; TCP Flags
+PUSH 0x02       ; SYN only
+AND
+PUSH 0x02
+JNE accept
+
+; Hash source IP for rate limiting
+LD32 26         ; Source IP
+HASH5           ; Hash with flow table
+DUP
+
+; Increment counter
+FLOW_LOAD       ; Load current count
+PUSH 1
+ADD
+DUP
+FLOW_STORE      ; Store new count
+
+; Check threshold
+PUSH 100
+JGT drop
+
+accept:
+    PUSH 1      ; Accept packet
+    RET
+
+drop:
+    PUSH 0      ; Drop packet
+    RET

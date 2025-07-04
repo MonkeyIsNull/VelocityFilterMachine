@@ -45,7 +45,7 @@ UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_M),x86_64)
     LIB_SRCS += $(SRC_DIR)/jit_x86_64.c
-else ifeq ($(UNAME_M),aarch64)
+else ifneq ($(filter $(UNAME_M),aarch64 arm64),)
     LIB_SRCS += $(SRC_DIR)/jit_arm64.c
 endif
 

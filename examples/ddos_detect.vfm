@@ -1,0 +1,45 @@
+; HTTP DDoS Detection Filter
+; Drop HTTP requests with suspicious patterns
+
+; Check for IPv4
+LD16 12         ; EtherType
+PUSH 0x0800     ; IPv4
+JNE accept
+
+; Check for TCP port 80/443
+LD16 36         ; Dest port
+DUP
+PUSH 80
+JEQ check_http
+PUSH 443
+JNE accept
+
+check_http:
+    ; Look for HTTP patterns
+    LD32 54         ; First 4 bytes of payload
+    DUP
+    PUSH 0x47455420 ; "GET "
+    JEQ check_rate
+    PUSH 0x504F5354 ; "POST"
+    JNE accept
+
+check_rate:
+    ; Rate limit by source IP
+    LD32 26         ; Source IP
+    HASH5           ; Hash for flow table
+    FLOW_LOAD       ; Load current count
+    PUSH 50         ; 50 requests/sec limit
+    JGT drop
+
+    ; Update counter
+    PUSH 1
+    ADD
+    FLOW_STORE
+
+accept:
+    PUSH 1          ; Accept packet
+    RET
+
+drop:
+    PUSH 0          ; Drop packet
+    RET

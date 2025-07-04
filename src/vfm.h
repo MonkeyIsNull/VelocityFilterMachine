@@ -130,6 +130,48 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len);
 // Verify program safety
 int vfm_verify(const uint8_t *program, uint32_t len);
 
+// Extended verification with instruction counting
+int vfm_verify_extended(const uint8_t *program, uint32_t len, uint32_t max_instructions);
+
+// Disassemble program for debugging
+void vfm_disassemble(const uint8_t *program, uint32_t len, char *output, size_t output_size);
+
+// BPF compilation targets
+typedef struct bpf_insn {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+} bpf_insn_t;
+
+typedef struct ebpf_insn {
+    uint8_t code;
+    uint8_t dst_reg:4;
+    uint8_t src_reg:4;
+    int16_t off;
+    int32_t imm;
+} ebpf_insn_t;
+
+typedef struct bpf_program {
+    uint32_t bf_len;
+    bpf_insn_t *bf_insns;
+} bpf_program_t;
+
+// Compilation to various BPF targets
+int vfm_to_bpf(const uint8_t *vfm_prog, uint32_t vfm_len, bpf_insn_t *bpf_prog, uint32_t *bpf_len);
+int vfm_to_ebpf(const uint8_t *vfm_prog, uint32_t vfm_len, ebpf_insn_t *ebpf_prog, uint32_t *ebpf_len);
+int vfm_to_cbpf(const uint8_t *vfm_prog, uint32_t vfm_len, bpf_program_t *prog);
+int vfm_to_xdp(const uint8_t *vfm_prog, uint32_t vfm_len, char *c_code, size_t code_size);
+
+// JIT compilation for x86-64
+void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len);
+void vfm_jit_free(void *code, size_t size);
+uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len);
+
+// JIT compilation for ARM64
+void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
+bool vfm_jit_available_arm64(void);
+
 // Platform-specific optimizations
 void vfm_enable_optimizations(vfm_state_t *vm);
 
