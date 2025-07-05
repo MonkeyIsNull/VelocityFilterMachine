@@ -256,6 +256,8 @@ The programming manual covers:
 ## Advanced Usage
 
 ### VFLisp Language Reference
+![vfmlisp Logo](vfm_lisp2.png)
+
 VFLisp provides an intuitive Lisp-like syntax for packet filtering:
 
 **Basic Syntax:**
