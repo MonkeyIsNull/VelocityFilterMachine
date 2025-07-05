@@ -42,7 +42,7 @@ VFM is designed to be the fastest, safest packet filtering VM available. It comb
 
 ### Build from Source
 ```bash
-git clone <repository-url>
+git clone https://github.com/MonkeyIsNull/VelocityFilterMachine 
 cd VelocityFilterMachine
 make all
 ```
