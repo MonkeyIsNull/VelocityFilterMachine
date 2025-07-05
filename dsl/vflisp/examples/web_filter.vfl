@@ -1,0 +1,6 @@
+; Web traffic filter - accept HTTP and HTTPS traffic
+; This filter checks for TCP packets on ports 80 or 443
+
+(and (= proto 6)
+     (or (= dst-port 80)
+         (= dst-port 443)))

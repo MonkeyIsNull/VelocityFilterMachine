@@ -1,0 +1,11 @@
+; Complex filter - demonstrates nested conditionals and arithmetic
+; Accept SSH traffic from trusted networks, or any HTTPS traffic
+
+(if (= proto 6)
+    (or (and (= dst-port 22)
+             (or (and (>= src-ip 3232235776)
+                      (<= src-ip 3232236031))
+                 (and (>= src-ip 167772160)
+                      (<= src-ip 184549375))))
+        (= dst-port 443))
+    0)

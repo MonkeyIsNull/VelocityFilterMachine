@@ -1,0 +1,7 @@
+; IP address filter - accept packets from specific IP ranges
+; This demonstrates IP address comparisons using 32-bit arithmetic
+
+(or (and (>= src-ip 3232235776)    ; 192.168.1.0/24
+         (<= src-ip 3232236031))
+    (and (>= src-ip 167772160)     ; 10.0.0.0/8
+         (<= src-ip 184549375)))

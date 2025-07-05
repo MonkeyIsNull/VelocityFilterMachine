@@ -1,0 +1,4 @@
+; TCP filter - accept only TCP packets
+; This filter checks if the IP protocol field is 6 (TCP)
+
+(= proto 6)

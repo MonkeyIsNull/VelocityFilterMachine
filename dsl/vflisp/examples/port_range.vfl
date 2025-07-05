@@ -1,0 +1,5 @@
+; Port range filter - accept packets in port range 1000-2000
+; This demonstrates arithmetic comparisons
+
+(and (>= dst-port 1000)
+     (<= dst-port 2000))

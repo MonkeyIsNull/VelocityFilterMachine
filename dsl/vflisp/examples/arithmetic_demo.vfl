@@ -1,0 +1,4 @@
+; Arithmetic demonstration - port calculation
+; Accept packets where destination port is divisible by 10
+
+(= (% dst-port 10) 0)

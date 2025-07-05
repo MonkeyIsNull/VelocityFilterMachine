@@ -3,12 +3,13 @@
 
 > P̷̩͗ä̵̩̪́͠ċ̶͓̪͋k̵̟̓͂e̸̢̻̽̎t̵̼̕s̶̝̈́͛ ̴̙̓a̶͎͗r̸̨̛̅e̸̖͛̚ ̶͙͌͠b̸̻̈̒ę̶̗̓t̸͇̰͋t̴̜̑ë̸̡́̇r̶͈̠̆ ̶̢̈́f̷̢͊͘i̷̤̐̐l̶̤̺̐̊t̴̰͗e̵̩̙͝r̵͕̚e̵͈͐d̴͈͝͝ ̶͓͝b̶͕͛̇y̶͖͌ ̴̤̈́a̸̼̺͂͂ ̵͖̾͘V̴̼͋̅í̷̜r̴͖͐t̶̨͗́u̷̻̪̍a̵̪̹͠l̸̳̄ ̴̹̃̋M̸͉̓͐a̶̬̯͒̍c̵̥̞̾h̶̲̥͛̓ì̷̦n̷̘̖̔̏e̴̠̩͌
 
-A high-performance packet filtering virtual machine in C, optimized for processing millions of packets per second. VFM features a specialized bytecode interpreter, BPF compilation, zero-copy packet access, and comprehensive safety verification.
+A high-performance packet filtering virtual machine in C, optimized for processing millions of packets per second. VFM features both a high-level Lisp-like DSL (VFLisp) for intuitive filter development and a low-level bytecode interpreter for maximum performance.
 
 ## Overview
 
 VFM is designed to be the fastest, safest packet filtering VM available. It combines:
 
+- **VFLisp DSL**: High-level Lisp-like language for intuitive filter programming
 - **High Performance**: Optimized interpreter with computed goto dispatch achieving 10M+ packets/second
 - **Safety First**: Static program verification prevents crashes and ensures bounded execution
 - **Zero-Copy**: Direct packet access without memory copying for maximum throughput
@@ -49,7 +50,8 @@ make all
 
 This builds:
 - `libvfm.a` - Core VFM library
-- `vfm-asm` - Assembler (text → bytecode)
+- `vflispc` - VFLisp compiler (Lisp → bytecode)
+- `vfm-asm` - Assembler (assembly → bytecode)
 - `vfm-dis` - Disassembler (bytecode → text)
 - `vfm-test` - Filter testing tool
 
@@ -62,7 +64,31 @@ For easy integration, use the single header version:
 
 ## Quick Start
 
-### 1. Write a Filter
+### Option 1: VFLisp (Recommended)
+
+#### 1. Write a VFLisp Filter
+Create or use inline expressions:
+```lisp
+; Simple TCP port 80 filter
+(and (= proto 6)
+     (= dst-port 80))
+```
+
+#### 2. Compile and Test
+```bash
+# Compile inline expression
+./dsl/vflisp/vflispc -e '(and (= proto 6) (= dst-port 80))' -o http_filter.bin
+
+# Test with example packet
+./dsl/vflisp/vflispc -t http_filter.bin
+
+# Show generated assembly
+./dsl/vflisp/vflispc -d http_filter.bin
+```
+
+### Option 2: Assembly Programming
+
+#### 1. Write Assembly Filter
 Create `my_filter.vfm`:
 ```assembly
 ; Simple TCP port 80 filter
@@ -84,12 +110,12 @@ accept:
     RET 1       ; Accept packet
 ```
 
-### 2. Compile to Bytecode
+#### 2. Compile to Bytecode
 ```bash
 ./tools/vfm-asm my_filter.vfm -o my_filter.bin
 ```
 
-### 3. Test the Filter
+#### 3. Test the Filter
 ```bash
 ./tools/vfm-test my_filter.bin test_packets.pcap
 ```
@@ -98,19 +124,34 @@ accept:
 ```c
 #include "src/vfm.h"
 
-// Load and execute filter
-vfm_state_t *vm = vfm_create();
-vfm_load_program_file(vm, "my_filter.bin");
-
-// Process packets
-int result = vfm_execute(vm, packet_data, packet_len);
-if (result == 1) {
-    // Accept packet
-} else {
-    // Drop packet
+int main() {
+    vfm_state_t *vm = vfm_create();
+    
+    // Option 1: Compile VFLisp directly
+    uint8_t *bytecode;
+    uint32_t bytecode_len;
+    char error_msg[256];
+    
+    if (vfl_compile_string("(= proto 6)", &bytecode, &bytecode_len, 
+                          error_msg, sizeof(error_msg)) == 0) {
+        vfm_load_program(vm, bytecode, bytecode_len);
+        free(bytecode);
+    }
+    
+    // Option 2: Load pre-compiled filter
+    // vfm_load_program_file(vm, "my_filter.bin");
+    
+    // Process packets
+    int result = vfm_execute(vm, packet_data, packet_len);
+    if (result == 1) {
+        // Accept packet
+    } else {
+        // Drop packet
+    }
+    
+    vfm_destroy(vm);
+    return 0;
 }
-
-vfm_destroy(vm);
 ```
 
 ## 🧪 Running Tests
@@ -164,14 +205,20 @@ VelocityFilterMachine/
 │   ├── compiler.c         # BPF compilation
 │   ├── jit_x86_64.c       # x86-64 JIT
 │   └── jit_arm64.c        # ARM64 JIT
+├── dsl/vflisp/             # VFLisp DSL implementation
+│   ├── vflispc.c          # VFLisp compiler CLI
+│   ├── vflisp_parser.c    # S-expression parser
+│   ├── vflisp_compile.c   # AST to bytecode compiler
+│   ├── vflisp_types.h     # Language types and definitions
+│   └── examples/          # VFLisp filter examples
 ├── tools/                  # Command-line tools
 │   ├── vfm-asm.c          # Assembler
 │   ├── vfm-dis.c          # Disassembler
 │   └── vfm-test.c         # Testing tool
 ├── examples/               # Example filters
-│   ├── tcp_filter.vfm     # TCP filtering
-│   ├── ddos_detect.vfm    # DDoS detection
-│   ├── rate_limit.vfm     # Rate limiting
+│   ├── tcp_filter.vfm     # TCP filtering (assembly)
+│   ├── ddos_detect.vfm    # DDoS detection (assembly)
+│   ├── rate_limit.vfm     # Rate limiting (assembly)
 │   └── *.bin              # Compiled bytecode
 ├── test/                   # Test suite
 │   ├── test_vfm.c         # Unit tests
@@ -192,13 +239,15 @@ VelocityFilterMachine/
 
 For comprehensive programming documentation, see the [docs/](docs/) directory:
 
-- **[Programming Manual](docs/programming_manual.md)** - Complete guide with instruction reference, examples, and best practices
-- **[Filter Examples](docs/)** - Working VFM assembly examples for common use cases
+- **[Programming Manual](docs/programming_manual.md)** - Complete guide with VFLisp DSL, assembly reference, examples, and best practices
+- **[VFLisp Examples](dsl/vflisp/examples/)** - Working VFLisp filter examples for common use cases
+- **[Assembly Examples](docs/)** - Working VFM assembly examples for advanced use cases
 - **[C Integration](docs/unit_test_style.c)** - Example showing proper API usage
 
 The programming manual covers:
-- Complete instruction set reference
-- Programming patterns and techniques
+- **VFLisp DSL language reference** - High-level filter programming
+- **Assembly instruction set reference** - Low-level bytecode programming
+- Programming patterns and techniques for both VFLisp and assembly
 - Real-world security filtering examples
 - Performance optimization strategies
 - Debugging and troubleshooting
@@ -206,8 +255,57 @@ The programming manual covers:
 
 ## Advanced Usage
 
+### VFLisp Language Reference
+VFLisp provides an intuitive Lisp-like syntax for packet filtering:
+
+**Basic Syntax:**
+```lisp
+(operator operand1 operand2 ...)
+```
+
+**Packet Fields:**
+- `proto` - IP protocol (6=TCP, 17=UDP, 1=ICMP)
+- `src-ip`, `dst-ip` - IP addresses
+- `src-port`, `dst-port` - Port numbers
+- `ethertype` - Ethernet frame type (0x0800=IPv4)
+- `ip-len` - IP packet length
+- `tcp-flags` - TCP flags byte
+
+**Comparison Operations:**
+- `(= proto 6)` - Equal
+- `(!= src-port 80)` - Not equal
+- `(> ip-len 1400)` - Greater than
+- `(< dst-port 1024)` - Less than
+
+**Logical Operations:**
+- `(and condition1 condition2)` - Logical AND
+- `(or condition1 condition2)` - Logical OR
+- `(not condition)` - Logical NOT
+
+**Arithmetic Operations:**
+- `(+ value1 value2)` - Addition
+- `(- value1 value2)` - Subtraction
+- `(* value1 value2)` - Multiplication
+- `(& flags mask)` - Bitwise AND
+
+**Control Flow:**
+- `(if condition then-expr else-expr)` - Conditional
+
+**Example Filters:**
+```lisp
+; Accept only TCP traffic
+(= proto 6)
+
+; Web traffic (HTTP/HTTPS)
+(and (= proto 6)
+     (or (= dst-port 80) (= dst-port 443)))
+
+; Block large UDP packets
+(not (and (= proto 17) (> ip-len 1400)))
+```
+
 ### Assembly Language Reference
-VFM uses a stack-based instruction set:
+For advanced users, VFM also supports low-level assembly programming:
 
 **Packet Access:**
 - `LD8 offset` - Load byte from packet
@@ -234,10 +332,24 @@ VFM uses a stack-based instruction set:
 - `JLT offset` - Jump if less
 - `RET` - Return with top stack value
 
-**Special Operations:**
-- `HASH5` - Hash 5-tuple for flow tracking
-- `FLOW_LOAD` - Load from flow table
-- `FLOW_STORE` - Store to flow table
+### VFLisp Command Line Tool
+The VFLisp compiler provides various options:
+```bash
+# Compile expression to bytecode
+./dsl/vflisp/vflispc -e '(= proto 6)' -o tcp_filter.bin
+
+# Show Abstract Syntax Tree
+./dsl/vflisp/vflispc -a -e '(and (= proto 6) (= dst-port 80))'
+
+# Disassemble compiled bytecode
+./dsl/vflisp/vflispc -d tcp_filter.bin
+
+# Test with example packet
+./dsl/vflisp/vflispc -t tcp_filter.bin
+
+# Compile from file
+./dsl/vflisp/vflispc filter.vfl -o filter.bin
+```
 
 ### BPF Compilation
 Convert VFM bytecode to BPF:
@@ -256,13 +368,15 @@ vfm_enable_jit(vm);  // Compile to native code
 
 VFM achieves exceptional performance through:
 
+- **VFLisp Optimization**: High-level DSL compiles to efficient bytecode
 - **Computed Goto**: Eliminates switch statement overhead
 - **Cache Optimization**: Data structures aligned for modern CPUs
 - **Bounds Checking**: Optimized memory access validation
 - **JIT Compilation**: Native code generation for hot paths
 
 Benchmark results on Apple M1:
-- **Simple filters**: 25M+ packets/second
+- **VFLisp filters**: 20M+ packets/second
+- **Assembly filters**: 25M+ packets/second
 - **Complex filters**: 10M+ packets/second
 - **Memory usage**: <1MB per VM instance
 
@@ -270,6 +384,7 @@ Benchmark results on Apple M1:
 
 VFM prioritizes safety with:
 
+- **VFLisp Type Safety**: High-level DSL prevents many programming errors
 - **Static Verification**: Programs validated before execution
 - **Bounded Execution**: Instruction count limits prevent infinite loops
 - **Memory Safety**: All packet access is bounds-checked

@@ -1,0 +1,5 @@
+; TCP SYN filter - accept only TCP SYN packets
+; This demonstrates bitwise operations on TCP flags
+
+(and (= proto 6)
+     (= (& tcp-flags 2) 2))
