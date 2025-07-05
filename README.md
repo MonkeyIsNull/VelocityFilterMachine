@@ -154,7 +154,7 @@ int main() {
 }
 ```
 
-## 🧪 Running Tests
+## Running Tests
 
 ### Unit Tests
 ```bash
