@@ -10,7 +10,7 @@ TEST_FLAGS = -I./test
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     # macOS optimizations
-    CFLAGS += -framework Accelerate
+    LDFLAGS += -framework Accelerate
     ifdef APPLE_SILICON
         # Apple Silicon specific flags
         CFLAGS += -mcpu=apple-m1 -mtune=native

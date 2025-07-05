@@ -22,8 +22,6 @@ typedef struct vfm_verifier {
 // Forward declarations
 static int verify_cfg(vfm_verifier_t *v, uint32_t pc, int32_t stack_depth);
 static int verify_instruction(vfm_verifier_t *v, uint32_t pc, uint8_t opcode);
-static bool is_jump_instruction(uint8_t opcode);
-static bool is_conditional_jump(uint8_t opcode);
 
 // Main verification function
 int vfm_verify(const uint8_t *program, uint32_t len) {
@@ -271,11 +269,6 @@ static int verify_instruction(vfm_verifier_t *v, uint32_t pc, uint8_t opcode) {
         case VFM_LD64: {
             // Check packet offset bounds
             uint16_t offset = *(uint16_t*)&v->program[pc + 1];
-            uint32_t access_size = 1;
-            
-            if (opcode == VFM_LD16) access_size = 2;
-            else if (opcode == VFM_LD32) access_size = 4;
-            else if (opcode == VFM_LD64) access_size = 8;
             
             // We can't verify packet bounds statically, but we can check
             // that the offset is reasonable - reject obviously invalid offsets
@@ -314,18 +307,6 @@ static int verify_instruction(vfm_verifier_t *v, uint32_t pc, uint8_t opcode) {
     return VFM_SUCCESS;
 }
 
-// Check if instruction is a jump
-static bool is_jump_instruction(uint8_t opcode) {
-    return (opcode == VFM_JMP || opcode == VFM_JEQ || opcode == VFM_JNE ||
-            opcode == VFM_JGT || opcode == VFM_JLT || opcode == VFM_JGE ||
-            opcode == VFM_JLE);
-}
-
-// Check if instruction is a conditional jump
-static bool is_conditional_jump(uint8_t opcode) {
-    return (opcode == VFM_JEQ || opcode == VFM_JNE || opcode == VFM_JGT ||
-            opcode == VFM_JLT || opcode == VFM_JGE || opcode == VFM_JLE);
-}
 
 // Additional verification functions for advanced checks
 int vfm_verify_extended(const uint8_t *program, uint32_t len, uint32_t max_instructions) {

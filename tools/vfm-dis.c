@@ -47,22 +47,6 @@ static uint64_t read_u64_le(const uint8_t *data) {
     return (uint64_t)read_u32_le(data) | ((uint64_t)read_u32_le(data + 4) << 32);
 }
 
-// Print hex dump of instruction
-static void print_hex_dump(disassembler_t *dis, const uint8_t *data, uint32_t size) {
-    if (!dis->show_hex) return;
-    
-    fprintf(dis->output, "    ; ");
-    for (uint32_t i = 0; i < size; i++) {
-        fprintf(dis->output, "%02x ", data[i]);
-        if (i > 0 && (i + 1) % 16 == 0) {
-            fprintf(dis->output, "\n    ; ");
-        }
-    }
-    if (size % 16 != 0) {
-        fprintf(dis->output, "\n");
-    }
-}
-
 // Disassemble one instruction
 static int disassemble_instruction(disassembler_t *dis, const uint8_t *program, 
                                    uint32_t program_size, uint32_t *pc) {

@@ -129,10 +129,8 @@ typedef struct bpf_compiler {
 
 // Helper functions for BPF compilation
 static int emit_bpf(bpf_compiler_t *c, uint16_t code, uint8_t jt, uint8_t jf, uint32_t k);
-static int compile_stack_op(bpf_compiler_t *c, uint8_t op);
 static int simulate_stack_push(bpf_compiler_t *c);
 static int simulate_stack_pop(bpf_compiler_t *c);
-static int fixup_jumps(bpf_compiler_t *c, uint32_t *label_map, uint32_t label_count);
 
 // Helper function to emit BPF instruction
 static int emit_bpf(bpf_compiler_t *c, uint16_t code, uint8_t jt, uint8_t jf, uint32_t k) {
