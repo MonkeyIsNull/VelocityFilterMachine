@@ -1,5 +1,6 @@
 # Velocity Filter Machine (VFM)
-![vfm Logo](vfm.png)
+
+<img src="vfm.png" alt="vfm" width="80%" />
 
 > P̷̩͗ä̵̩̪́͠ċ̶͓̪͋k̵̟̓͂e̸̢̻̽̎t̵̼̕s̶̝̈́͛ ̴̙̓a̶͎͗r̸̨̛̅e̸̖͛̚ ̶͙͌͠b̸̻̈̒ę̶̗̓t̸͇̰͋t̴̜̑ë̸̡́̇r̶͈̠̆ ̶̢̈́f̷̢͊͘i̷̤̐̐l̶̤̺̐̊t̴̰͗e̵̩̙͝r̵͕̚e̵͈͐d̴͈͝͝ ̶͓͝b̶͕͛̇y̶͖͌ ̴̤̈́a̸̼̺͂͂ ̵͖̾͘V̴̼͋̅í̷̜r̴͖͐t̶̨͗́u̷̻̪̍a̵̪̹͠l̸̳̄ ̴̹̃̋M̸͉̓͐a̶̬̯͒̍c̵̥̞̾h̶̲̥͛̓ì̷̦n̷̘̖̔̏e̴̠̩͌
 
