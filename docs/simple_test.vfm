@@ -1,0 +1,3 @@
+; Just return 42
+PUSH 42
+RET

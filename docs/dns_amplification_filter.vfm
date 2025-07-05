@@ -1,0 +1,26 @@
+; Drop DNS responses that are too large (amplification attack)
+
+LD16 12         ; EtherType
+PUSH 0x0800     ; IPv4
+JNE accept
+
+LD8 23          ; IP Protocol
+PUSH 17         ; UDP
+JNE accept
+
+LD16 34         ; Source port
+PUSH 53         ; DNS
+JNE accept
+
+; Check packet size
+LD16 16         ; IP Total Length
+PUSH 512        ; DNS limit
+JGT drop        ; Suspiciously large
+
+accept:
+    PUSH 1
+    RET
+
+drop:
+    PUSH 0
+    RET

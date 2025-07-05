@@ -1,8 +1,11 @@
 # Velocity Filter Machine (VFM)
+![vfm Logo](vfm.png)
+
+> P̷̩͗ä̵̩̪́͠ċ̶͓̪͋k̵̟̓͂e̸̢̻̽̎t̵̼̕s̶̝̈́͛ ̴̙̓a̶͎͗r̸̨̛̅e̸̖͛̚ ̶͙͌͠b̸̻̈̒ę̶̗̓t̸͇̰͋t̴̜̑ë̸̡́̇r̶͈̠̆ ̶̢̈́f̷̢͊͘i̷̤̐̐l̶̤̺̐̊t̴̰͗e̵̩̙͝r̵͕̚e̵͈͐d̴͈͝͝ ̶͓͝b̶͕͛̇y̶͖͌ ̴̤̈́a̸̼̺͂͂ ̵͖̾͘V̴̼͋̅í̷̜r̴͖͐t̶̨͗́u̷̻̪̍a̵̪̹͠l̸̳̄ ̴̹̃̋M̸͉̓͐a̶̬̯͒̍c̵̥̞̾h̶̲̥͛̓ì̷̦n̷̘̖̔̏e̴̠̩͌
 
 A high-performance packet filtering virtual machine in C, optimized for processing millions of packets per second. VFM features a specialized bytecode interpreter, BPF compilation, zero-copy packet access, and comprehensive safety verification.
 
-## 🚀 Overview
+## Overview
 
 VFM is designed to be the fastest, safest packet filtering VM available. It combines:
 
@@ -13,7 +16,7 @@ VFM is designed to be the fastest, safest packet filtering VM available. It comb
 - **BPF Compatible**: Compiles VFM bytecode to native BPF for kernel integration
 - **JIT Compilation**: x86-64 and ARM64 JIT compilers for maximum performance
 
-## 🎯 Use Cases
+## Use Cases
 
 ### Network Security
 - **DDoS Protection**: Detect and mitigate volumetric attacks
@@ -30,7 +33,7 @@ VFM is designed to be the fastest, safest packet filtering VM available. It comb
 - **CDN Optimization**: Intelligent traffic routing and caching
 - **Load Balancing**: Distribute traffic based on custom rules
 
-## 🛠️ Installation
+## Installation
 
 ### Prerequisites
 - GCC or Clang compiler
@@ -57,7 +60,7 @@ For easy integration, use the single header version:
 #include "include/vfm.h"
 ```
 
-## 🏃‍♂️ Quick Start
+## Quick Start
 
 ### 1. Write a Filter
 Create `my_filter.vfm`:
@@ -149,7 +152,7 @@ gcc -I../src simple_verify.c ../src/verifier.c -o simple_verify
 ./simple_verify
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 VelocityFilterMachine/
@@ -178,10 +181,30 @@ VelocityFilterMachine/
 │   └── bench.c
 ├── include/                # Single header library
 │   └── vfm.h
+├── docs/                   # Programming documentation
+│   ├── programming_manual.md  # Complete programming guide
+│   ├── *.vfm              # Working filter examples
+│   └── *.c                # C integration examples
 └── Makefile               # Build configuration
 ```
 
-## 🔧 Advanced Usage
+## Documentation
+
+For comprehensive programming documentation, see the [docs/](docs/) directory:
+
+- **[Programming Manual](docs/programming_manual.md)** - Complete guide with instruction reference, examples, and best practices
+- **[Filter Examples](docs/)** - Working VFM assembly examples for common use cases
+- **[C Integration](docs/unit_test_style.c)** - Example showing proper API usage
+
+The programming manual covers:
+- Complete instruction set reference
+- Programming patterns and techniques
+- Real-world security filtering examples
+- Performance optimization strategies
+- Debugging and troubleshooting
+- Full API documentation
+
+## Advanced Usage
 
 ### Assembly Language Reference
 VFM uses a stack-based instruction set:
@@ -229,7 +252,7 @@ vfm_state_t *vm = vfm_create();
 vfm_enable_jit(vm);  // Compile to native code
 ```
 
-## 📊 Performance
+## Performance
 
 VFM achieves exceptional performance through:
 
@@ -238,12 +261,12 @@ VFM achieves exceptional performance through:
 - **Bounds Checking**: Optimized memory access validation
 - **JIT Compilation**: Native code generation for hot paths
 
-Benchmark results on Apple M2:
+Benchmark results on Apple M1:
 - **Simple filters**: 25M+ packets/second
 - **Complex filters**: 10M+ packets/second
 - **Memory usage**: <1MB per VM instance
 
-## 🔒 Security
+## Security
 
 VFM prioritizes safety with:
 
@@ -253,7 +276,7 @@ VFM prioritizes safety with:
 - **Stack Protection**: Stack overflow/underflow detection
 - **No Unsafe Operations**: No raw memory access or system calls
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -262,11 +285,11 @@ VFM prioritizes safety with:
 5. Run the test suite: `make test`
 6. Submit a pull request
 
-## 📄 License
+## License
 
 MIT License - see LICENSE file for details.
 
-## 🎯 Performance Goals
+## Performance Goals
 
 - **Throughput**: 10M+ packets/second for simple filters
 - **Latency**: <50ns per packet overhead

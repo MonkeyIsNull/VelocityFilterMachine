@@ -1,0 +1,7 @@
+; Arithmetic example: Calculate (10 + 5) * 2
+PUSH 10
+PUSH 5
+ADD         ; 10 + 5 = 15
+PUSH 2
+MUL         ; 15 * 2 = 30
+RET         ; Return 30

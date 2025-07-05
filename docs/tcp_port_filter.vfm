@@ -1,0 +1,23 @@
+; Accept only TCP packets on ports 80 or 443
+LD16 12         ; EtherType
+PUSH 0x0800     ; IPv4
+JNE drop
+
+LD8 23          ; IP Protocol
+PUSH 6          ; TCP
+JNE drop
+
+LD16 36         ; Destination port
+DUP             ; Duplicate for second check
+PUSH 80         ; HTTP
+JEQ accept
+PUSH 443        ; HTTPS
+JEQ accept
+
+drop:
+    PUSH 0
+    RET
+
+accept:
+    PUSH 1
+    RET

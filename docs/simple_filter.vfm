@@ -1,0 +1,10 @@
+; Accept all IPv4 packets
+LD16 12         ; Load EtherType at offset 12
+PUSH 0x0800     ; IPv4 EtherType
+JEQ accept      ; Jump if equal
+PUSH 0
+RET             ; Drop non-IPv4
+
+accept:
+    PUSH 1
+    RET         ; Accept IPv4
