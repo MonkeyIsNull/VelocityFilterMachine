@@ -63,6 +63,11 @@ For easy integration, use the single header version:
 #include "include/vfm.h"
 ```
 
+## Note
+
+Right now, this is very alpha software. You'll note there is no release and no version number. It is written with PacketVelocity in mind, which is currently unreleased, so your mileage may vary with other usage. Feel free to submit issues and PRs.
+
+
 ## Quick Start
 
 ### Option 1: VFLisp (Recommended)
