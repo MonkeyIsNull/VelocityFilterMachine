@@ -33,6 +33,7 @@ SRC_DIR = src
 TOOL_DIR = tools
 TEST_DIR = test
 BENCH_DIR = bench
+VFLISP_DIR = dsl/vflisp
 
 # Core library sources
 LIB_SRCS = $(SRC_DIR)/vfm.c \
@@ -51,12 +52,21 @@ endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
+# VFLisp sources
+VFLISP_SRCS = $(VFLISP_DIR)/vflisp_parser.c \
+              $(VFLISP_DIR)/vflisp_compile.c
+
+VFLISP_OBJS = $(VFLISP_SRCS:.c=.o)
+
 # Tool sources
 TOOL_SRCS = $(TOOL_DIR)/vfm-asm.c \
             $(TOOL_DIR)/vfm-dis.c \
             $(TOOL_DIR)/vfm-test.c
 
 TOOLS = $(TOOL_SRCS:.c=)
+
+# VFLisp compiler
+VFLISPC = $(VFLISP_DIR)/vflispc
 
 # Test sources
 TEST_SRCS = $(TEST_DIR)/test_vfm.c
@@ -67,9 +77,9 @@ BENCH_SRCS = $(BENCH_DIR)/bench.c
 BENCH_BINS = $(BENCH_SRCS:.c=)
 
 # Targets
-.PHONY: all clean debug test bench tools
+.PHONY: all clean debug test bench tools vflisp
 
-all: libvfm.a tools
+all: libvfm.a tools vflisp
 
 # Static library
 libvfm.a: $(LIB_OBJS)
@@ -90,6 +100,15 @@ $(TOOL_DIR)/vfm-dis: $(TOOL_DIR)/vfm-dis.c libvfm.a
 
 $(TOOL_DIR)/vfm-test: $(TOOL_DIR)/vfm-test.c libvfm.a
 	$(CC) $(CFLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+
+# VFLisp
+vflisp: $(VFLISPC)
+
+$(VFLISPC): $(VFLISP_DIR)/vflispc.c $(VFLISP_OBJS) libvfm.a
+	$(CC) $(CFLAGS) -I$(VFLISP_DIR) $< $(VFLISP_OBJS) -o $@ -L. -lvfm $(LDFLAGS)
+
+$(VFLISP_DIR)/%.o: $(VFLISP_DIR)/%.c
+	$(CC) $(CFLAGS) -I$(VFLISP_DIR) -c $< -o $@
 
 # Tests
 test: $(TEST_BINS)
@@ -113,18 +132,20 @@ debug: clean all
 clean:
 	rm -f $(LIB_OBJS) libvfm.a
 	rm -f $(TOOLS)
+	rm -f $(VFLISP_OBJS) $(VFLISPC)
 	rm -f $(TEST_BINS)
 	rm -f $(BENCH_BINS)
 
 # Install (optional)
 PREFIX ?= /usr/local
-install: libvfm.a
+install: libvfm.a tools vflisp
 	install -d $(PREFIX)/lib
 	install -d $(PREFIX)/include
 	install -d $(PREFIX)/bin
 	install -m 644 libvfm.a $(PREFIX)/lib/
 	install -m 644 include/vfm.h $(PREFIX)/include/
 	install -m 755 $(TOOLS) $(PREFIX)/bin/
+	install -m 755 $(VFLISPC) $(PREFIX)/bin/
 
 uninstall:
 	rm -f $(PREFIX)/lib/libvfm.a
@@ -132,3 +153,4 @@ uninstall:
 	rm -f $(PREFIX)/bin/vfm-asm
 	rm -f $(PREFIX)/bin/vfm-dis
 	rm -f $(PREFIX)/bin/vfm-test
+	rm -f $(PREFIX)/bin/vflispc
