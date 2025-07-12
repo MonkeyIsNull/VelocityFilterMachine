@@ -49,6 +49,31 @@ cd VelocityFilterMachine
 make all
 ```
 
+### Apple Silicon (M1/M2/M3) Support
+VFM includes optimized JIT compilation for Apple Silicon processors. To build with JIT support:
+
+```bash
+# Build with JIT support
+make all
+
+# Test JIT functionality
+./test/jit_test
+```
+
+**Important for Apple Silicon users:**
+- The build system automatically applies the required `com.apple.security.cs.allow-jit` entitlement
+- For development, ad-hoc signing is sufficient
+- For distribution, you must sign with a valid Developer ID certificate
+- See `docs/apple_silicon_jit.md` for detailed JIT implementation notes
+
+```bash
+# Check JIT entitlements
+codesign -d --entitlements :- tools/vfm-test
+
+# Sign for distribution (replace with your certificate)
+codesign --entitlements entitlements.plist -s "Developer ID Application: Your Name-Blah-blah-blah" tools/vfm-test
+```
+
 This builds:
 - `libvfm.a` - Core VFM library
 - `vflispc` - VFLisp compiler (Lisp → bytecode)

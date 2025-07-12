@@ -18,6 +18,17 @@ ifeq ($(UNAME_S),Darwin)
     # Use clang on macOS for better optimization
     CC = clang
     CFLAGS += -fvectorize -fslp-vectorize
+    
+    # JIT support requires proper entitlements on macOS
+    CODESIGN = codesign
+    ENTITLEMENTS = entitlements.plist
+    
+    # Check if we have a valid signing identity
+    SIGNING_IDENTITY := $(shell security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | cut -d'"' -f2)
+    ifeq ($(SIGNING_IDENTITY),)
+        # Fall back to ad-hoc signing for development
+        SIGNING_IDENTITY = -
+    endif
 else ifeq ($(UNAME_S),Linux)
     # Linux optimizations
     CFLAGS += -march=native -mtune=native
@@ -94,18 +105,34 @@ tools: $(TOOLS)
 
 $(TOOL_DIR)/vfm-asm: $(TOOL_DIR)/vfm-asm.c libvfm.a
 	$(CC) $(CFLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 $(TOOL_DIR)/vfm-dis: $(TOOL_DIR)/vfm-dis.c libvfm.a
 	$(CC) $(CFLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 $(TOOL_DIR)/vfm-test: $(TOOL_DIR)/vfm-test.c libvfm.a
 	$(CC) $(CFLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 # VFLisp
 vflisp: $(VFLISPC)
 
 $(VFLISPC): $(VFLISP_DIR)/vflispc.c $(VFLISP_OBJS) libvfm.a
 	$(CC) $(CFLAGS) -I$(VFLISP_DIR) $< $(VFLISP_OBJS) -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 $(VFLISP_DIR)/%.o: $(VFLISP_DIR)/%.c
 	$(CC) $(CFLAGS) -I$(VFLISP_DIR) -c $< -o $@
@@ -116,6 +143,10 @@ test: $(TEST_BINS)
 
 $(TEST_DIR)/test_vfm: $(TEST_DIR)/test_vfm.c libvfm.a
 	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 # Benchmarks
 bench: $(BENCH_BINS)
@@ -123,6 +154,10 @@ bench: $(BENCH_BINS)
 
 $(BENCH_DIR)/bench: $(BENCH_DIR)/bench.c libvfm.a
 	$(CC) $(CFLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
 
 # Debug build
 debug: CFLAGS += $(DEBUG_FLAGS)
