@@ -9,7 +9,6 @@
 static int vfl_compile_node(vfl_node_t *node, vfl_compile_ctx_t *ctx);
 static int vfl_emit_opcode(vfl_compile_ctx_t *ctx, uint8_t opcode);
 static int vfl_emit_u16(vfl_compile_ctx_t *ctx, uint16_t value);
-static int vfl_emit_u32(vfl_compile_ctx_t *ctx, uint32_t value);
 static int vfl_emit_u64(vfl_compile_ctx_t *ctx, uint64_t value);
 
 // Compilation context management
@@ -64,15 +63,6 @@ static int vfl_emit_u16(vfl_compile_ctx_t *ctx, uint16_t value) {
     if (vfl_ensure_capacity(ctx, 2) < 0) return -1;
     ctx->bytecode[ctx->bytecode_pos++] = value & 0xFF;
     ctx->bytecode[ctx->bytecode_pos++] = (value >> 8) & 0xFF;
-    return 0;
-}
-
-static int vfl_emit_u32(vfl_compile_ctx_t *ctx, uint32_t value) {
-    if (vfl_ensure_capacity(ctx, 4) < 0) return -1;
-    ctx->bytecode[ctx->bytecode_pos++] = value & 0xFF;
-    ctx->bytecode[ctx->bytecode_pos++] = (value >> 8) & 0xFF;
-    ctx->bytecode[ctx->bytecode_pos++] = (value >> 16) & 0xFF;
-    ctx->bytecode[ctx->bytecode_pos++] = (value >> 24) & 0xFF;
     return 0;
 }
 

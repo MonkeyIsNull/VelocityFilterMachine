@@ -94,6 +94,24 @@ static void emit_epilogue(vfm_jit_arm64_t *jit) {
     emit_ret(jit);
 }
 
+// Helper function to flush cache and protect memory for execution
+static bool flush_and_protect_memory(uint8_t *code, size_t code_pos, size_t code_size) {
+#ifdef __APPLE__
+    // Flush instruction cache and switch to execute mode
+    sys_icache_invalidate(code, code_pos);
+    pthread_jit_write_protect_np(1);
+    
+    if (mprotect(code, code_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, code_size);
+        return false;
+    }
+#else
+    // On other ARM64 systems, just flush the instruction cache
+    __builtin___clear_cache((char*)code, (char*)code + code_pos);
+#endif
+    return true;
+}
+
 // JIT compile for ARM64
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
     size_t code_size = 4096;
@@ -173,18 +191,9 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
                 emit_ldr_imm(&jit, ARM64_X0, ARM64_X21, 0);  // Load return value
                 emit_epilogue(&jit);
                 
-#ifdef __APPLE__
-                // Flush instruction cache and switch to execute mode
-                sys_icache_invalidate(jit.code, jit.code_pos);
-                pthread_jit_write_protect_np(1);
-                
-                if (mprotect(jit.code, jit.code_size, PROT_READ | PROT_EXEC) != 0) {
-                    munmap(jit.code, jit.code_size);
+                if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
                     return NULL;
                 }
-#else
-                __builtin___clear_cache((char*)jit.code, (char*)jit.code + jit.code_pos);
-#endif
                 
                 return jit.code;
             }
@@ -194,17 +203,9 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
                 emit_mov_imm(&jit, ARM64_X0, -1);  // Return error
                 emit_epilogue(&jit);
                 
-#ifdef __APPLE__
-                sys_icache_invalidate(jit.code, jit.code_pos);
-                pthread_jit_write_protect_np(1);
-                
-                if (mprotect(jit.code, jit.code_size, PROT_READ | PROT_EXEC) != 0) {
-                    munmap(jit.code, jit.code_size);
+                if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
                     return NULL;
                 }
-#else
-                __builtin___clear_cache((char*)jit.code, (char*)jit.code + jit.code_pos);
-#endif
                 
                 return jit.code;
         }
@@ -214,22 +215,9 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
     emit_mov_imm(&jit, ARM64_X0, 0);
     emit_epilogue(&jit);
     
-#ifdef __APPLE__
-    // On Apple Silicon, we need to flush the instruction cache and switch to execute-only
-    sys_icache_invalidate(jit.code, jit.code_pos);
-    
-    // Switch to execute-only mode (W^X enforcement)
-    pthread_jit_write_protect_np(1);
-    
-    // Change memory protection to execute-only
-    if (mprotect(jit.code, jit.code_size, PROT_READ | PROT_EXEC) != 0) {
-        munmap(jit.code, jit.code_size);
+    if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
         return NULL;
     }
-#else
-    // On other ARM64 systems, just flush the instruction cache
-    __builtin___clear_cache((char*)jit.code, (char*)jit.code + jit.code_pos);
-#endif
     
     return jit.code;
 }
