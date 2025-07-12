@@ -12,12 +12,16 @@ Running JIT code on Apple Silicon (M1, M2, M3+ chips) requires special handling 
 ### 2. W^X (Write XOR Execute) Enforcement
 Apple Silicon enforces that memory pages cannot be both writable and executable simultaneously:
 
-1. **Write Phase**: Allocate memory with `PROT_READ | PROT_WRITE` and `MAP_JIT`
-2. **Generate Code**: Write JIT instructions to memory
+1. **Allocate Phase**: Allocate memory with `PROT_READ | PROT_WRITE` and `MAP_JIT`
+2. **Write Phase**: 
+   - Call `pthread_jit_write_protect_np(0)` to disable write protection
+   - Write JIT instructions to memory
 3. **Execute Phase**: 
    - Call `sys_icache_invalidate()` to flush instruction cache
    - Call `pthread_jit_write_protect_np(1)` to enable write protection
    - Change memory protection to `PROT_READ | PROT_EXEC` using `mprotect()`
+
+**Critical Note**: You **must** call `pthread_jit_write_protect_np(0)` before writing JIT code, or the hardened runtime may prevent writes to MAP_JIT pages.
 
 ### 3. Entitlements
 The application must have the `com.apple.security.cs.allow-jit` entitlement:
@@ -54,13 +58,19 @@ uint8_t *code = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
 ### Finalizing JIT Code
 ```c
 #ifdef __APPLE__
-// Flush instruction cache
+// Step 1: Disable write protection before writing JIT code
+pthread_jit_write_protect_np(0);
+
+// Step 2: Write your JIT instructions here
+// ... emit instructions ...
+
+// Step 3: Flush instruction cache
 sys_icache_invalidate(code, code_size);
 
-// Enable write protection
+// Step 4: Enable write protection
 pthread_jit_write_protect_np(1);
 
-// Make executable
+// Step 5: Make executable
 mprotect(code, code_size, PROT_READ | PROT_EXEC);
 #else
 // Other platforms - just flush cache

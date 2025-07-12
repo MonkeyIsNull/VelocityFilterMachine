@@ -118,6 +118,13 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
         .code_pos = 0
     };
     
+#ifdef __APPLE__
+    // On Apple Silicon, disable write protection before generating JIT code
+    // This is REQUIRED - without this call, hardened runtime may prevent
+    // writing instructions to the allocated MAP_JIT pages
+    pthread_jit_write_protect_np(0);
+#endif
+    
     emit_prologue(&jit);
     
     // Register allocation:
