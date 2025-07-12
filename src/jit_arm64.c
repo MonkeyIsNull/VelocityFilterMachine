@@ -3,6 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 
 #ifdef __aarch64__
 
@@ -90,18 +94,54 @@ static void emit_epilogue(vfm_jit_arm64_t *jit) {
     emit_ret(jit);
 }
 
+// Helper function to flush cache and protect memory for execution
+static bool flush_and_protect_memory(uint8_t *code, size_t code_pos, size_t code_size) {
+#ifdef __APPLE__
+    // Flush instruction cache and switch to execute mode
+    sys_icache_invalidate(code, code_pos);
+    pthread_jit_write_protect_np(1);
+    
+    if (mprotect(code, code_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, code_size);
+        return false;
+    }
+#else
+    // On other ARM64 systems, just flush the instruction cache
+    __builtin___clear_cache((char*)code, (char*)code + code_pos);
+#endif
+    return true;
+}
+
 // JIT compile for ARM64
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
+    size_t code_size = 4096;
+    
+#ifdef __APPLE__
+    // On Apple Silicon, use MAP_JIT for JIT compilation
+    uint8_t *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE, 
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+#else
+    // On other ARM64 systems, use traditional RWX mapping
+    uint8_t *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+    
+    if (code == MAP_FAILED) {
+        return NULL;
+    }
+    
     vfm_jit_arm64_t jit = {
-        .code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
-        .code_size = 4096,
+        .code = code,
+        .code_size = code_size,
         .code_pos = 0
     };
     
-    if (jit.code == MAP_FAILED) {
-        return NULL;
-    }
+#ifdef __APPLE__
+    // On Apple Silicon, disable write protection before generating JIT code
+    // This is REQUIRED - without this call, hardened runtime may prevent
+    // writing instructions to the allocated MAP_JIT pages
+    pthread_jit_write_protect_np(0);
+#endif
     
     emit_prologue(&jit);
     
@@ -150,6 +190,11 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
                 // Return top of stack
                 emit_ldr_imm(&jit, ARM64_X0, ARM64_X21, 0);  // Load return value
                 emit_epilogue(&jit);
+                
+                if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
+                    return NULL;
+                }
+                
                 return jit.code;
             }
             
@@ -157,6 +202,11 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
                 // Unsupported instruction - fall back to interpreter
                 emit_mov_imm(&jit, ARM64_X0, -1);  // Return error
                 emit_epilogue(&jit);
+                
+                if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
+                    return NULL;
+                }
+                
                 return jit.code;
         }
     }
@@ -165,12 +215,28 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
     emit_mov_imm(&jit, ARM64_X0, 0);
     emit_epilogue(&jit);
     
+    if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
+        return NULL;
+    }
+    
     return jit.code;
 }
 
 // Check if JIT is available
 bool vfm_jit_available_arm64(void) {
-    return true;  // ARM64 JIT is available
+#ifdef __APPLE__
+    // On Apple Silicon, JIT requires the hardened runtime entitlement
+    // Try to allocate JIT memory to check if it's available
+    void *test_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE, 
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    if (test_mem == MAP_FAILED) {
+        return false;  // JIT not available (missing entitlement)
+    }
+    munmap(test_mem, 4096);
+    return true;
+#else
+    return true;  // ARM64 JIT is available on non-Apple systems
+#endif
 }
 
 #else
