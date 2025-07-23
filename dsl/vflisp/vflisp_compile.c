@@ -1,5 +1,5 @@
 #include "vflisp_types.h"
-#include "../../src/opcodes.h"
+#include "../../include/vfm.h"  // For opcodes and vfm_verify()
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,76 +150,50 @@ static int vfl_compile_binary_op(vfl_node_t *node, vfl_compile_ctx_t *ctx, uint8
     return 0;
 }
 
-// Compile comparison operation
+// Compile comparison operation - generates clean control flow pattern
 static int vfl_compile_comparison(vfl_node_t *node, vfl_compile_ctx_t *ctx, uint8_t jump_opcode) {
     if (node->data.list.count != 3) {
         snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Comparison requires exactly 2 arguments");
         return -1;
     }
     
-    // Compile both arguments
+    // Compile both arguments onto stack
     if (vfl_compile_node(node->data.list.children[1], ctx) < 0) return -1;
     if (vfl_compile_node(node->data.list.children[2], ctx) < 0) return -1;
     
-    // For equality, use a different approach
-    if (jump_opcode == VFM_JEQ) {
-        // Compare using subtract and check if result is zero
-        if (vfl_emit_opcode(ctx, VFM_SUB) < 0) return -1;
-        if (vfl_pop_stack(ctx) < 0) return -1;  // Pop two operands, push one result
-        
-        // Convert to boolean: if 0 then 1, else 0
-        // Duplicate the result for testing
-        if (vfl_emit_opcode(ctx, VFM_DUP) < 0) return -1;
-        if (vfl_push_stack(ctx) < 0) return -1;
-        
-        // Test if zero
-        if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
-        if (vfl_emit_u64(ctx, 0) < 0) return -1;
-        if (vfl_push_stack(ctx) < 0) return -1;
-        
-        // Jump to true branch if equal (difference is 0)
-        if (vfl_emit_opcode(ctx, VFM_JEQ) < 0) return -1;
-        if (vfl_emit_u16(ctx, 11) < 0) return -1;  // Jump to true branch
-        
-        // False branch: pop original value and push 0
-        if (vfl_pop_stack(ctx) < 0) return -1;  // Pop comparison result
-        if (vfl_pop_stack(ctx) < 0) return -1;  // Pop duplicate
-        if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
-        if (vfl_emit_u64(ctx, 0) < 0) return -1;
-        if (vfl_push_stack(ctx) < 0) return -1;
-        if (vfl_emit_opcode(ctx, VFM_JMP) < 0) return -1;
-        if (vfl_emit_u16(ctx, 10) < 0) return -1;  // Jump over true branch
-        
-        // True branch: pop duplicate and push 1
-        if (vfl_pop_stack(ctx) < 0) return -1;  // Pop comparison result
-        if (vfl_pop_stack(ctx) < 0) return -1;  // Pop duplicate
-        if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
-        if (vfl_emit_u64(ctx, 1) < 0) return -1;
-        if (vfl_push_stack(ctx) < 0) return -1;
-        
-        return 0;
-    }
-    
-    // For other comparisons, use the jump instruction directly
-    // Push 1 (true result)
-    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
-    if (vfl_emit_u64(ctx, 1) < 0) return -1;
-    if (vfl_push_stack(ctx) < 0) return -1;
-    
-    // Jump over false result if condition is true
+    // Use VFM's native comparison with clean control flow
+    // Jump to true branch if comparison succeeds
     if (vfl_emit_opcode(ctx, jump_opcode) < 0) return -1;
-    if (vfl_emit_u16(ctx, 10) < 0) return -1;  // Jump 10 bytes forward
+    uint32_t true_jump_pos = ctx->bytecode_pos;
+    if (vfl_emit_u16(ctx, 0) < 0) return -1;  // Will be patched
     
-    // Pop true result and push false result
-    if (vfl_emit_opcode(ctx, VFM_POP) < 0) return -1;
+    // The jump instruction consumes both operands from stack at runtime
     if (vfl_pop_stack(ctx) < 0) return -1;
+    if (vfl_pop_stack(ctx) < 0) return -1;
+    
+    // False branch: push 0 and jump to end
     if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
     if (vfl_emit_u64(ctx, 0) < 0) return -1;
     if (vfl_push_stack(ctx) < 0) return -1;
     
-    // Pop the two comparison operands
-    if (vfl_pop_stack(ctx) < 0) return -1;
-    if (vfl_pop_stack(ctx) < 0) return -1;
+    if (vfl_emit_opcode(ctx, VFM_JMP) < 0) return -1;
+    uint32_t end_jump_pos = ctx->bytecode_pos;
+    if (vfl_emit_u16(ctx, 0) < 0) return -1;  // Will be patched
+    
+    // Patch true branch jump offset
+    uint16_t true_offset = ctx->bytecode_pos - true_jump_pos - 2;
+    ctx->bytecode[true_jump_pos] = true_offset & 0xFF;
+    ctx->bytecode[true_jump_pos + 1] = (true_offset >> 8) & 0xFF;
+    
+    // True branch: push 1 (stack balance with false branch)
+    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
+    if (vfl_emit_u64(ctx, 1) < 0) return -1;
+    // Don't increment stack here since false branch already did
+    
+    // Patch end jump offset
+    uint16_t end_offset = ctx->bytecode_pos - end_jump_pos - 2;
+    ctx->bytecode[end_jump_pos] = end_offset & 0xFF;
+    ctx->bytecode[end_jump_pos + 1] = (end_offset >> 8) & 0xFF;
     
     return 0;
 }
@@ -320,30 +294,44 @@ static int vfl_compile_not(vfl_node_t *node, vfl_compile_ctx_t *ctx) {
     // Compile argument
     if (vfl_compile_node(node->data.list.children[1], ctx) < 0) return -1;
     
-    // Convert to boolean: if 0 then 1, else 0
+    // Compare with 0 to test if false
     if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
     if (vfl_emit_u64(ctx, 0) < 0) return -1;
     if (vfl_push_stack(ctx) < 0) return -1;
     
-    // Push 1 (true result)
+    // Jump to true branch if argument equals 0 (meaning NOT should return 1)
+    if (vfl_emit_opcode(ctx, VFM_JEQ) < 0) return -1;
+    uint32_t true_jump_pos = ctx->bytecode_pos;
+    if (vfl_emit_u16(ctx, 0) < 0) return -1;  // Will be patched
+    
+    // Comparison consumed both operands from stack
+    if (vfl_pop_stack(ctx) < 0) return -1;
+    if (vfl_pop_stack(ctx) < 0) return -1;
+    
+    // False branch: argument was non-zero, so NOT returns 0
+    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
+    if (vfl_emit_u64(ctx, 0) < 0) return -1;
+    if (vfl_push_stack(ctx) < 0) return -1;
+    
+    // Jump over true branch
+    if (vfl_emit_opcode(ctx, VFM_JMP) < 0) return -1;
+    uint32_t end_jump_pos = ctx->bytecode_pos;
+    if (vfl_emit_u16(ctx, 0) < 0) return -1;  // Will be patched
+    
+    // Patch true branch jump offset
+    uint16_t true_offset = ctx->bytecode_pos - true_jump_pos - 2;
+    ctx->bytecode[true_jump_pos] = true_offset & 0xFF;
+    ctx->bytecode[true_jump_pos + 1] = (true_offset >> 8) & 0xFF;
+    
+    // True branch: argument was zero, so NOT returns 1
     if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
     if (vfl_emit_u64(ctx, 1) < 0) return -1;
     if (vfl_push_stack(ctx) < 0) return -1;
     
-    // Jump over false result if condition is equal to 0
-    if (vfl_emit_opcode(ctx, VFM_JEQ) < 0) return -1;
-    if (vfl_emit_u16(ctx, 10) < 0) return -1;  // Jump 10 bytes forward
-    
-    // Pop true result and push false result
-    if (vfl_emit_opcode(ctx, VFM_POP) < 0) return -1;
-    if (vfl_pop_stack(ctx) < 0) return -1;
-    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
-    if (vfl_emit_u64(ctx, 0) < 0) return -1;
-    if (vfl_push_stack(ctx) < 0) return -1;
-    
-    // Pop the comparison operands
-    if (vfl_pop_stack(ctx) < 0) return -1;
-    if (vfl_pop_stack(ctx) < 0) return -1;
+    // Patch end jump offset
+    uint16_t end_offset = ctx->bytecode_pos - end_jump_pos - 2;
+    ctx->bytecode[end_jump_pos] = end_offset & 0xFF;
+    ctx->bytecode[end_jump_pos + 1] = (end_offset >> 8) & 0xFF;
     
     return 0;
 }
@@ -521,6 +509,14 @@ int vfl_compile(vfl_node_t *ast, uint8_t **bytecode, uint32_t *bytecode_len, cha
     // Check final stack state
     if (ctx->stack_depth != 1) {
         if (error_msg) snprintf(error_msg, error_msg_size, "Stack imbalance: expected 1, got %d", ctx->stack_depth);
+        vfl_compile_ctx_destroy(ctx);
+        return -1;
+    }
+    
+    // Verify generated bytecode
+    int verify_result = vfm_verify(ctx->bytecode, ctx->bytecode_pos);
+    if (verify_result < 0) {
+        if (error_msg) snprintf(error_msg, error_msg_size, "Bytecode verification failed: code %d", verify_result);
         vfl_compile_ctx_destroy(ctx);
         return -1;
     }

@@ -124,6 +124,14 @@ enum vfm_opcode {
     VFM_NOT,     // Bitwise NOT
     VFM_NEG,     // Arithmetic negation
     VFM_MOD,     // Modulo
+    
+    // Stack-based comparisons (leave boolean result on stack)
+    VFM_EQ,      // Equal comparison
+    VFM_NE,      // Not equal comparison
+    VFM_GT,      // Greater than comparison
+    VFM_LT,      // Less than comparison
+    VFM_GE,      // Greater or equal comparison
+    VFM_LE,      // Less or equal comparison
 
     VFM_OPCODE_MAX
 };
@@ -370,7 +378,13 @@ static const char *vfm_opcode_names[] = {
     [VFM_JLE]        = "JLE",
     [VFM_NOT]        = "NOT",
     [VFM_NEG]        = "NEG",
-    [VFM_MOD]        = "MOD"
+    [VFM_MOD]        = "MOD",
+    [VFM_EQ]         = "EQ",
+    [VFM_NE]         = "NE",
+    [VFM_GT]         = "GT",
+    [VFM_LT]         = "LT",
+    [VFM_GE]         = "GE",
+    [VFM_LE]         = "LE"
 };
 
 // Opcode format information
@@ -407,7 +421,13 @@ static const vfm_format_t vfm_opcode_format[] = {
     [VFM_JLE]        = VFM_FMT_OFFSET16, // jump offset
     [VFM_NOT]        = VFM_FMT_NONE,
     [VFM_NEG]        = VFM_FMT_NONE,
-    [VFM_MOD]        = VFM_FMT_NONE
+    [VFM_MOD]        = VFM_FMT_NONE,
+    [VFM_EQ]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_NE]         = VFM_FMT_NONE,     // stack-based comparison  
+    [VFM_GT]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LT]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_GE]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LE]         = VFM_FMT_NONE      // stack-based comparison
 };
 
 // Get instruction size in bytes
@@ -608,7 +628,13 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
         [VFM_FLOW_STORE]= &&op_flow_store,
         [VFM_NOT]       = &&op_not,
         [VFM_NEG]       = &&op_neg,
-        [VFM_MOD]       = &&op_mod
+        [VFM_MOD]       = &&op_mod,
+        [VFM_EQ]        = &&op_eq,
+        [VFM_NE]        = &&op_ne,
+        [VFM_GT]        = &&op_gt,
+        [VFM_LT]        = &&op_lt,
+        [VFM_GE]        = &&op_ge,
+        [VFM_LE]        = &&op_le
     };
     
     #define NEXT() \
@@ -946,6 +972,60 @@ op_mod:
         STACK_PUSH(vm, a % b);
         NEXT();
     }
+
+op_eq:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a == b) ? 1 : 0);
+        NEXT();
+    }
+
+op_ne:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a != b) ? 1 : 0);
+        NEXT();
+    }
+
+op_gt:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a > b) ? 1 : 0);
+        NEXT();
+    }
+
+op_lt:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a < b) ? 1 : 0);
+        NEXT();
+    }
+
+op_ge:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a >= b) ? 1 : 0);
+        NEXT();
+    }
+
+op_le:
+    {
+        uint64_t b, a;
+        STACK_POP(vm, b);
+        STACK_POP(vm, a);
+        STACK_PUSH(vm, (a <= b) ? 1 : 0);
+        NEXT();
+    }
 }
 
 // Simple verifier implementation
@@ -999,6 +1079,8 @@ int vfm_verify_extended(const uint8_t *program, uint32_t len, uint32_t max_instr
             case VFM_AND: case VFM_OR: case VFM_XOR: case VFM_SHL: case VFM_SHR:
             case VFM_JEQ: case VFM_JNE: case VFM_JGT: case VFM_JLT:
             case VFM_JGE: case VFM_JLE: case VFM_MOD:
+            case VFM_EQ: case VFM_NE: case VFM_GT: case VFM_LT:
+            case VFM_GE: case VFM_LE:
                 stack_depth -= 2;
                 stack_depth++;
                 break;
