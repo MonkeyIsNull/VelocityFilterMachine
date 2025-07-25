@@ -51,7 +51,6 @@ static vfm_jit_cache_t g_jit_cache = {0};
 
 // Forward declarations
 static uint32_t hash_program_fast(const uint8_t *data, uint32_t len);
-static void* allocate_jit_memory(size_t size);
 static void free_jit_memory(void *ptr, size_t size);
 static void cache_entry_destroy(vfm_jit_cache_entry_t *entry);
 static uint64_t get_timestamp_ns(void);
@@ -67,24 +66,6 @@ static uint32_t hash_program_fast(const uint8_t *data, uint32_t len) {
     return hash;
 }
 
-// Platform-specific JIT memory allocation
-static void* allocate_jit_memory(size_t size) {
-#ifdef VFM_APPLE_SILICON
-    // Apple Silicon requires MAP_JIT for JIT compilation
-    void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, 
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-    if (mem == MAP_FAILED) return NULL;
-    
-    // Enable write access for code generation
-    pthread_jit_write_protect_np(0);
-    return mem;
-#else
-    // Traditional RWX mapping for other platforms
-    void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (mem == MAP_FAILED) ? NULL : mem;
-#endif
-}
 
 static void free_jit_memory(void *ptr, size_t size) {
     if (ptr) {

@@ -4,7 +4,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
-#include "../src/vfm.h"
+#include "vfm.h"
 
 // Simple packet file format:
 // Each packet consists of:

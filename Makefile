@@ -53,7 +53,8 @@ VFLISP_DIR = dsl/vflisp
 LIB_SRCS = $(SRC_DIR)/vfm.c \
            $(SRC_DIR)/vfm_jit_cache.c \
            $(SRC_DIR)/verifier.c \
-           $(SRC_DIR)/compiler.c
+           $(SRC_DIR)/compiler.c \
+           $(SRC_DIR)/stubs.c
 
 # Platform-specific JIT sources
 UNAME_S := $(shell uname -s)

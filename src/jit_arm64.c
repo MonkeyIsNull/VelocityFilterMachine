@@ -77,16 +77,6 @@ static void emit_umov_x(vfm_jit_arm64_t *jit, int rd, int vn, int index) {
     emit_u32(jit, insn);
 }
 
-// Helper: calculate stack128 address from index
-// Input: sp128_index in ARM64_X22, base in ARM64_X23
-// Output: address in ARM64_X4
-static void emit_calc_stack128_addr(vfm_jit_arm64_t *jit) {
-    emit_mov_imm(jit, ARM64_X4, 16);                   // 16 bytes per vfm_u128_t
-    // X4 = sp128 * 16 (multiply index by element size)
-    // For ARM64, we can use shift left by 4 (since 16 = 2^4)
-    emit_u32(jit, 0xd37ef484);  // LSL X4, X22, #4
-    emit_add_reg(jit, ARM64_X4, ARM64_X23, ARM64_X4);  // X4 = base + (sp128 * 16)
-}
 
 // Emit LDR immediate
 static void emit_ldr_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
@@ -133,12 +123,6 @@ static void emit_cmeq_v16b(vfm_jit_arm64_t *jit, int vd, int vn, int vm) {
     emit_u32(jit, insn);
 }
 
-// Emit ADDP to reduce 128-bit comparison result to scalar
-static void emit_addp_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
-    // ADDP Vd.16B, Vn.16B, Vn.16B - Pairwise add to reduce to scalar
-    uint32_t insn = 0x6e20bc00 | (vn << 16) | (vn << 5) | vd;
-    emit_u32(jit, insn);
-}
 
 // Emit ADDV to efficiently reduce vector to scalar (single instruction)
 static void emit_addv_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
@@ -333,20 +317,6 @@ static void schedule_instructions(arm64_scheduler_t *sched, vfm_jit_arm64_t *jit
     sched->instruction_count = 0;  // Reset buffer
 }
 
-// Add instruction to scheduler buffer
-static void schedule_emit_u32(arm64_scheduler_t *sched, vfm_jit_arm64_t *jit, uint32_t insn) {
-    if (!sched->scheduling_enabled || sched->instruction_count >= sched->buffer_capacity) {
-        // Flush buffer if full or scheduling disabled
-        schedule_instructions(sched, jit);
-    }
-    
-    if (sched->instruction_count < sched->buffer_capacity) {
-        sched->instructions[sched->instruction_count++] = insn;
-    } else {
-        // Buffer full, emit directly
-        emit_u32(jit, insn);
-    }
-}
 
 // Flush any remaining instructions in scheduler
 static void flush_scheduler(arm64_scheduler_t *sched, vfm_jit_arm64_t *jit) {
@@ -373,21 +343,7 @@ static void emit_stp_q(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) 
     emit_u32(jit, insn);
 }
 
-// Emit LDP with post-increment for Q-registers
-static void emit_ldp_q_post(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
-    // LDP Qd1, Qd2, [Xn], #imm - Load pair with post-increment
-    // Useful for streaming operations through stack regions
-    uint32_t insn = 0xacc00000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
-    emit_u32(jit, insn);
-}
 
-// Emit STP with pre-decrement for Q-registers
-static void emit_stp_q_pre(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
-    // STP Qd1, Qd2, [Xn, #imm]! - Store pair with pre-decrement
-    // Useful for pushing multiple values to stack efficiently
-    uint32_t insn = 0xad800000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
-    emit_u32(jit, insn);
-}
 
 // Optimized bulk stack operations using NEON parallelism
 
@@ -868,7 +824,7 @@ void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len,
                 }
                 break;
                 
-            default:
+            default: {
                 // Use hot path optimization for frequently executed instructions
                 bool is_hot_path = false;
                 for (uint32_t i = 0; i < profile->hot_path_count; i++) {
@@ -886,6 +842,7 @@ void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len,
                 // Standard opcode handling (simplified)
                 emit_u32(&jit, 0xd503201f); // nop (placeholder)
                 break;
+            }
         }
         
         pc += vfm_instruction_size(opcode);

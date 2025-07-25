@@ -4,7 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
-#include "../src/vfm.h"
+#include "vfm.h"
 
 // Maximum program size
 #define MAX_PROGRAM_SIZE 65536

@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,9 +74,16 @@ typedef enum {
 // Maximum limits
 #define VFM_MAX_INSN 10000
 #define VFM_MAX_STACK 256
+#define VFM_STACK_SIZE 256
 #define VFM_MAX_PACKET 65535
 #define VFM_MAX_PROGRAM_SIZE (64 * 1024)  // 64KB max program
 #define VFM_FLOW_TABLE_SIZE 65536         // 64K flow entries
+
+// 128-bit value for IPv6 addresses and large integers
+typedef struct vfm_u128 {
+    uint64_t low;   // Lower 64 bits
+    uint64_t high;  // Upper 64 bits
+} vfm_u128_t;
 
 // Opcodes
 enum vfm_opcode {
@@ -160,6 +168,10 @@ enum vfm_opcode {
     VFM_BULK_LOAD128,    // Bulk load multiple 128-bit values using NEON LDP
     VFM_PARALLEL_EQ128,  // Parallel comparison of multiple 128-bit pairs
     VFM_STACK_PREFETCH,  // Prefetch stack regions for cache optimization
+    
+    // Additional opcodes for JIT optimizations
+    VFM_EQ32,            // 32-bit equality comparison
+    VFM_PUSH32,          // Push 32-bit value
 
     VFM_OPCODE_MAX
 };
@@ -287,6 +299,9 @@ typedef struct vfm_core_context {
     // Core-local flow statistics
     vfm_flow_stats_t flow_stats VFM_CACHE_ALIGNED;
     
+    // JIT compiled code for this core
+    void *jit_code;
+    
 } VFM_CACHE_ALIGNED vfm_core_context_t;
 
 // Shared read-only data across all cores
@@ -379,10 +394,25 @@ typedef struct vfm_state {
         
         // Stack pointer
         uint32_t sp;
+        uint32_t sp128;             // 128-bit stack pointer
         
         // Packet bounds (hot for bounds checking)
         uint16_t packet_len;
         uint16_t _pad1;  // Padding for alignment
+        
+        // Packet data pointer
+        const uint8_t *packet;
+        
+        // Program data
+        const uint8_t *program;
+        uint32_t program_len;
+        uint32_t _pad2;
+        
+        // Stack memory
+        uint64_t *stack;
+        uint32_t stack_size;
+        vfm_u128_t *stack128;
+        uint32_t stack128_size;
         
         // Flow state table (moved to hot for Phase 2.3 cache optimization)
         vfm_flow_entry_t *flow_table;
@@ -400,30 +430,34 @@ typedef struct vfm_state {
         } flow_stats;
     } VFM_CACHE_ALIGNED hot;
     
-    // Packet data pointer (read-only)
-    const uint8_t *packet;
+    // Cold data - less frequently accessed
+    struct {
+        // JIT compilation cache
+        void *jit_code;             // Compiled native code (NULL if not compiled)
+        size_t jit_code_size;       // Size of JIT code for cleanup
+        bool jit_enabled;           // Whether to attempt JIT compilation
+        struct vfm_jit_cache_entry *jit_cache_entry;  // Reference to cached entry
+        
+        // Platform-specific optimization hints
+        struct {
+            bool use_prefetch;      // Enable prefetching
+            bool use_huge_pages;    // Use huge pages for flow table
+            uint8_t prefetch_distance;  // How far ahead to prefetch
+            uint8_t _pad[5];        // Padding to 8 bytes
+        } hints;
+        
+        uint64_t _pad_cold[4];      // Padding for future expansion
+    } cold;
     
-    // Stack - aligned for performance
-    uint64_t *stack VFM_ALIGNED(16);
-    uint32_t stack_size;
-    uint32_t _pad2;  // Padding
-    
-    // Program
-    const uint8_t *program;
-    uint32_t program_len;
-    uint32_t _pad3;  // Padding
-    
-    // Registers (faster than pure stack) - cache line aligned
+    // Registers (faster than pure stack) - cache line aligned  
     uint64_t regs[16] VFM_CACHE_ALIGNED;
     
-    // JIT compilation cache
-    void *jit_code;             // Compiled native code (NULL if not compiled)
-    size_t jit_code_size;       // Size of JIT code for cleanup
-    bool jit_enabled;           // Whether to attempt JIT compilation
-    struct vfm_jit_cache_entry *jit_cache_entry;  // Reference to cached entry
-    uint8_t _pad_jit[3];        // Padding adjustment
+    // 128-bit stack for IPv6 operations
+    vfm_u128_t *stack128;
+    uint32_t stack128_size;
+    uint32_t _pad4;
     
-    // Platform-specific optimization hints
+    // Platform-specific optimization hints (legacy compatibility)
     struct {
         bool use_prefetch;      // Enable prefetching
         bool use_huge_pages;    // Use huge pages for flow table
@@ -431,6 +465,218 @@ typedef struct vfm_state {
         uint8_t _pad[5];        // Padding to 8 bytes
     } hints;
 } vfm_state_t;
+
+// 128-bit utility functions
+static inline vfm_u128_t vfm_u128_from_bytes(const uint8_t bytes[16]) {
+    vfm_u128_t result;
+    // IPv6 addresses are in network byte order (big-endian)
+    result.high = ((uint64_t)bytes[0] << 56) | ((uint64_t)bytes[1] << 48) |
+                  ((uint64_t)bytes[2] << 40) | ((uint64_t)bytes[3] << 32) |
+                  ((uint64_t)bytes[4] << 24) | ((uint64_t)bytes[5] << 16) |
+                  ((uint64_t)bytes[6] << 8)  | ((uint64_t)bytes[7]);
+    result.low  = ((uint64_t)bytes[8] << 56) | ((uint64_t)bytes[9] << 48) |
+                  ((uint64_t)bytes[10] << 40) | ((uint64_t)bytes[11] << 32) |
+                  ((uint64_t)bytes[12] << 24) | ((uint64_t)bytes[13] << 16) |
+                  ((uint64_t)bytes[14] << 8)  | ((uint64_t)bytes[15]);
+    return result;
+}
+
+static inline bool vfm_u128_eq(vfm_u128_t a, vfm_u128_t b) {
+    return a.high == b.high && a.low == b.low;
+}
+
+static inline bool vfm_u128_ne(vfm_u128_t a, vfm_u128_t b) {
+    return !vfm_u128_eq(a, b);
+}
+
+static inline bool vfm_u128_gt(vfm_u128_t a, vfm_u128_t b) {
+    return (a.high > b.high) || (a.high == b.high && a.low > b.low);
+}
+
+static inline bool vfm_u128_lt(vfm_u128_t a, vfm_u128_t b) {
+    return (a.high < b.high) || (a.high == b.high && a.low < b.low);
+}
+
+static inline bool vfm_u128_ge(vfm_u128_t a, vfm_u128_t b) {
+    return vfm_u128_eq(a, b) || vfm_u128_gt(a, b);
+}
+
+static inline bool vfm_u128_le(vfm_u128_t a, vfm_u128_t b) {
+    return vfm_u128_eq(a, b) || vfm_u128_lt(a, b);
+}
+
+static inline vfm_u128_t vfm_u128_and(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high & b.high;
+    result.low = a.low & b.low;
+    return result;
+}
+
+static inline vfm_u128_t vfm_u128_or(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high | b.high;
+    result.low = a.low | b.low;
+    return result;
+}
+
+static inline vfm_u128_t vfm_u128_xor(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high ^ b.high;
+    result.low = a.low ^ b.low;
+    return result;
+}
+
+// Opcode names for debugging (stub implementation)
+static const char *vfm_opcode_names[] = {
+    [VFM_LD8]        = "LD8",
+    [VFM_LD16]       = "LD16",
+    [VFM_LD32]       = "LD32",
+    [VFM_LD64]       = "LD64",
+    [VFM_PUSH]       = "PUSH",
+    [VFM_POP]        = "POP",
+    [VFM_DUP]        = "DUP",
+    [VFM_SWAP]       = "SWAP",
+    [VFM_ADD]        = "ADD",
+    [VFM_SUB]        = "SUB",
+    [VFM_MUL]        = "MUL",
+    [VFM_DIV]        = "DIV",
+    [VFM_AND]        = "AND",
+    [VFM_OR]         = "OR",
+    [VFM_XOR]        = "XOR",
+    [VFM_SHL]        = "SHL",
+    [VFM_SHR]        = "SHR",
+    [VFM_JMP]        = "JMP",
+    [VFM_JEQ]        = "JEQ",
+    [VFM_JNE]        = "JNE",
+    [VFM_JGT]        = "JGT",
+    [VFM_JLT]        = "JLT",
+    [VFM_RET]        = "RET",
+    [VFM_HASH5]      = "HASH5",
+    [VFM_CSUM]       = "CSUM",
+    [VFM_PARSE]      = "PARSE",
+    [VFM_FLOW_LOAD]  = "FLOW_LOAD",
+    [VFM_FLOW_STORE] = "FLOW_STORE",
+    [VFM_JGE]        = "JGE",
+    [VFM_JLE]        = "JLE",
+    [VFM_NOT]        = "NOT",
+    [VFM_NEG]        = "NEG",
+    [VFM_MOD]        = "MOD",
+    [VFM_EQ]         = "EQ",
+    [VFM_NE]         = "NE",
+    [VFM_GT]         = "GT",
+    [VFM_LT]         = "LT",
+    [VFM_GE]         = "GE",
+    [VFM_LE]         = "LE",
+    [VFM_LD128]      = "LD128",
+    [VFM_PUSH128]    = "PUSH128",
+    [VFM_EQ128]      = "EQ128",
+    [VFM_NE128]      = "NE128",
+    [VFM_GT128]      = "GT128",
+    [VFM_LT128]      = "LT128",
+    [VFM_GE128]      = "GE128",
+    [VFM_LE128]      = "LE128",
+    [VFM_AND128]     = "AND128",
+    [VFM_OR128]      = "OR128",
+    [VFM_XOR128]     = "XOR128",
+    [VFM_JEQ128]     = "JEQ128",
+    [VFM_JNE128]     = "JNE128",
+    [VFM_JGT128]     = "JGT128",
+    [VFM_JLT128]     = "JLT128",
+    [VFM_JGE128]     = "JGE128",
+    [VFM_JLE128]     = "JLE128",
+    [VFM_HASH6]      = "HASH6",
+    [VFM_IP_VER]     = "IP_VER",
+    [VFM_IPV6_EXT]   = "IPV6_EXT",
+    [VFM_BULK_LOAD128]   = "BULK_LOAD128",
+    [VFM_PARALLEL_EQ128] = "PARALLEL_EQ128",
+    [VFM_STACK_PREFETCH] = "STACK_PREFETCH",
+    [VFM_EQ32]       = "EQ32",
+    [VFM_PUSH32]     = "PUSH32",
+};
+
+// Opcode format information (stub implementation)
+static const vfm_format_t vfm_opcode_format[] = {
+    [VFM_LD8]        = VFM_FMT_IMM16,    // offset
+    [VFM_LD16]       = VFM_FMT_IMM16,    // offset
+    [VFM_LD32]       = VFM_FMT_IMM16,    // offset
+    [VFM_LD64]       = VFM_FMT_IMM16,    // offset
+    [VFM_PUSH]       = VFM_FMT_IMM64,    // value to push
+    [VFM_POP]        = VFM_FMT_NONE,
+    [VFM_DUP]        = VFM_FMT_NONE,
+    [VFM_SWAP]       = VFM_FMT_NONE,
+    [VFM_ADD]        = VFM_FMT_NONE,
+    [VFM_SUB]        = VFM_FMT_NONE,
+    [VFM_MUL]        = VFM_FMT_NONE,
+    [VFM_DIV]        = VFM_FMT_NONE,
+    [VFM_AND]        = VFM_FMT_NONE,
+    [VFM_OR]         = VFM_FMT_NONE,
+    [VFM_XOR]        = VFM_FMT_NONE,
+    [VFM_SHL]        = VFM_FMT_NONE,
+    [VFM_SHR]        = VFM_FMT_NONE,
+    [VFM_JMP]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JEQ]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JNE]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JGT]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JLT]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_RET]        = VFM_FMT_NONE,
+    [VFM_HASH5]      = VFM_FMT_NONE,
+    [VFM_CSUM]       = VFM_FMT_NONE,
+    [VFM_PARSE]      = VFM_FMT_NONE,
+    [VFM_FLOW_LOAD]  = VFM_FMT_NONE,
+    [VFM_FLOW_STORE] = VFM_FMT_NONE,
+    [VFM_JGE]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JLE]        = VFM_FMT_OFFSET16, // jump offset
+    [VFM_NOT]        = VFM_FMT_NONE,
+    [VFM_NEG]        = VFM_FMT_NONE,
+    [VFM_MOD]        = VFM_FMT_NONE,
+    [VFM_EQ]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_NE]         = VFM_FMT_NONE,     // stack-based comparison  
+    [VFM_GT]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LT]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_GE]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LE]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LD128]      = VFM_FMT_OFFSET16, // packet offset for 128-bit load
+    [VFM_PUSH128]    = VFM_FMT_IMM128,   // 128-bit immediate value
+    [VFM_EQ128]      = VFM_FMT_NONE,     // compares two 128-bit values on stack
+    [VFM_NE128]      = VFM_FMT_NONE,
+    [VFM_GT128]      = VFM_FMT_NONE,
+    [VFM_LT128]      = VFM_FMT_NONE,
+    [VFM_GE128]      = VFM_FMT_NONE,
+    [VFM_LE128]      = VFM_FMT_NONE,
+    [VFM_AND128]     = VFM_FMT_NONE,
+    [VFM_OR128]      = VFM_FMT_NONE,
+    [VFM_XOR128]     = VFM_FMT_NONE,
+    [VFM_JEQ128]     = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JNE128]     = VFM_FMT_OFFSET16,
+    [VFM_JGT128]     = VFM_FMT_OFFSET16,
+    [VFM_JLT128]     = VFM_FMT_OFFSET16,
+    [VFM_JGE128]     = VFM_FMT_OFFSET16,
+    [VFM_JLE128]     = VFM_FMT_OFFSET16,
+    [VFM_HASH6]      = VFM_FMT_NONE,     // computes IPv6 5-tuple hash
+    [VFM_IP_VER]     = VFM_FMT_NONE,     // pushes IP version (4 or 6)
+    [VFM_IPV6_EXT]   = VFM_FMT_IMM8,     // extracts IPv6 extension header field (field type as immediate)
+    [VFM_BULK_LOAD128]   = VFM_FMT_IMM8, // bulk load operations
+    [VFM_PARALLEL_EQ128] = VFM_FMT_IMM8, // parallel comparison count
+    [VFM_STACK_PREFETCH] = VFM_FMT_IMM8, // prefetch depth
+    [VFM_EQ32]       = VFM_FMT_NONE,     // 32-bit equality comparison
+    [VFM_PUSH32]     = VFM_FMT_IMM32,    // 32-bit immediate value
+};
+
+// Get instruction size in bytes
+static inline uint32_t vfm_instruction_size(uint8_t opcode) {
+    if (opcode >= VFM_OPCODE_MAX) return 0;
+    
+    switch (vfm_opcode_format[opcode]) {
+        case VFM_FMT_NONE:     return 1;
+        case VFM_FMT_IMM8:     return 2;
+        case VFM_FMT_IMM16:    return 3;
+        case VFM_FMT_IMM32:    return 5;
+        case VFM_FMT_IMM64:    return 9;
+        case VFM_FMT_IMM128:   return 17;  // 1 byte opcode + 16 bytes IPv6 address
+        case VFM_FMT_OFFSET16: return 3;
+        default:               return 0;
+    }
+}
 
 // JIT Cache Configuration
 #define VFM_JIT_CACHE_MAX_ENTRIES 1024        // Maximum cached programs
@@ -511,6 +757,10 @@ typedef struct vfm_stats {
     uint64_t cache_hits;
     uint64_t cache_misses;
     double avg_instructions_per_packet;
+    uint64_t instructions_executed;     // Total instructions executed
+    uint64_t flow_hits;                 // Flow table hits
+    uint64_t flow_misses;               // Flow table misses
+    uint64_t total_execution_time_ns;   // Total execution time in nanoseconds
 } vfm_stats_t;
 
 // Batch processing API for better performance
@@ -640,6 +890,9 @@ void vfm_reset_stats(vfm_state_t *vm);
 int vfm_flow_table_init(vfm_state_t *vm, uint32_t size);
 void vfm_flow_table_destroy(vfm_state_t *vm);
 void vfm_flow_table_get_stats(const vfm_state_t *vm, vfm_flow_stats_t *stats);
+
+// Function declarations for external stub implementations (only for functions not static in vfm.c)
+// Note: Many functions like update_execution_profile, worker_thread, etc. are implemented as static in vfm.c
 
 // Hash functions for testing (cross-platform optimized)
 uint64_t vfm_hash_ipv4_5tuple(const uint8_t *packet, uint16_t len);
@@ -1597,6 +1850,66 @@ int vfm_execute_batch(vfm_state_t *vm, vfm_batch_t *batch) {
     }
     
     return VFM_SUCCESS;
+}
+
+// 128-bit utility functions
+static inline vfm_u128_t vfm_u128_from_bytes(const uint8_t bytes[16]) {
+    vfm_u128_t result;
+    // IPv6 addresses are in network byte order (big-endian)
+    result.high = ((uint64_t)bytes[0] << 56) | ((uint64_t)bytes[1] << 48) |
+                  ((uint64_t)bytes[2] << 40) | ((uint64_t)bytes[3] << 32) |
+                  ((uint64_t)bytes[4] << 24) | ((uint64_t)bytes[5] << 16) |
+                  ((uint64_t)bytes[6] << 8)  | ((uint64_t)bytes[7]);
+    result.low  = ((uint64_t)bytes[8] << 56) | ((uint64_t)bytes[9] << 48) |
+                  ((uint64_t)bytes[10] << 40) | ((uint64_t)bytes[11] << 32) |
+                  ((uint64_t)bytes[12] << 24) | ((uint64_t)bytes[13] << 16) |
+                  ((uint64_t)bytes[14] << 8)  | ((uint64_t)bytes[15]);
+    return result;
+}
+
+static inline bool vfm_u128_eq(vfm_u128_t a, vfm_u128_t b) {
+    return a.high == b.high && a.low == b.low;
+}
+
+static inline bool vfm_u128_ne(vfm_u128_t a, vfm_u128_t b) {
+    return !vfm_u128_eq(a, b);
+}
+
+static inline bool vfm_u128_gt(vfm_u128_t a, vfm_u128_t b) {
+    return (a.high > b.high) || (a.high == b.high && a.low > b.low);
+}
+
+static inline bool vfm_u128_lt(vfm_u128_t a, vfm_u128_t b) {
+    return (a.high < b.high) || (a.high == b.high && a.low < b.low);
+}
+
+static inline bool vfm_u128_ge(vfm_u128_t a, vfm_u128_t b) {
+    return vfm_u128_eq(a, b) || vfm_u128_gt(a, b);
+}
+
+static inline bool vfm_u128_le(vfm_u128_t a, vfm_u128_t b) {
+    return vfm_u128_eq(a, b) || vfm_u128_lt(a, b);
+}
+
+static inline vfm_u128_t vfm_u128_and(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high & b.high;
+    result.low = a.low & b.low;
+    return result;
+}
+
+static inline vfm_u128_t vfm_u128_or(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high | b.high;
+    result.low = a.low | b.low;
+    return result;
+}
+
+static inline vfm_u128_t vfm_u128_xor(vfm_u128_t a, vfm_u128_t b) {
+    vfm_u128_t result;
+    result.high = a.high ^ b.high;
+    result.low = a.low ^ b.low;
+    return result;
 }
 
 #endif // VFM_IMPLEMENTATION

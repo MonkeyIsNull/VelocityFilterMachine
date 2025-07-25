@@ -6,6 +6,17 @@
 #include <sys/mman.h>
 #include <pthread.h>
 
+// Forward declarations for static functions
+static uint64_t get_timestamp_ns(void);
+static void* worker_thread(void *arg);
+static void* worker_thread_with_affinity(void *arg);
+static vfm_execution_profile_t* create_execution_profile(uint32_t instruction_count);
+static void update_execution_profile(vfm_execution_profile_t *profile, uint32_t pc, bool branch_taken, uint64_t cycles);
+static void analyze_packet_pattern(vfm_execution_profile_t *profile, const uint8_t *packet, uint16_t len);
+static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program, uint32_t len);
+static bool should_recompile(vfm_shared_context_t *shared);
+static void update_adaptive_thresholds(vfm_shared_context_t *shared);
+
 // Platform-specific includes
 #ifdef VFM_PLATFORM_MACOS
     #include <mach/mach.h>
@@ -1486,7 +1497,7 @@ static VFM_ALWAYS_INLINE uint64_t flow_table_get_lockfree(vfm_flow_entry_t *flow
     if (VFM_UNLIKELY(!flow_table)) return 0;
     
     uint32_t index = key & flow_table_mask;
-    vfm_flow_entry_t *entry = &flow_table[index];
+    vfm_flow_entry_t *entry __attribute__((unused)) = &flow_table[index];
     
     // Linear probing with atomic reads (max 4 probes for cache efficiency)
     for (int probe = 0; probe <= 4; probe++) {
@@ -2060,52 +2071,11 @@ static int set_thread_affinity(pthread_t thread, uint32_t core_id) {
 #endif
 }
 
-// Get current thread affinity
-static int get_thread_affinity(pthread_t thread, uint32_t *core_id) {
-#ifdef VFM_PLATFORM_MACOS
-    // macOS: Get thread affinity policy
-    thread_affinity_policy_data_t policy;
-    mach_msg_type_number_t count = THREAD_AFFINITY_POLICY_COUNT;
-    boolean_t get_default = FALSE;
-    
-    kern_return_t result = thread_policy_get(pthread_mach_thread_np(thread),
-                                            THREAD_AFFINITY_POLICY,
-                                            (thread_policy_t)&policy,
-                                            &count, &get_default);
-    if (result == KERN_SUCCESS) {
-        *core_id = policy.affinity_tag;
-        return 0;
-    }
-    return -1;
-    
-#elif defined(__linux__)
-    // Linux: Get thread affinity using sched_getaffinity
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    
-    if (pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset) == 0) {
-        // Find first set CPU
-        for (int i = 0; i < CPU_SETSIZE; i++) {
-            if (CPU_ISSET(i, &cpuset)) {
-                *core_id = (uint32_t)i;
-                return 0;
-            }
-        }
-    }
-    return -1;
-    
-#else
-    // Unsupported platform
-    (void)thread;
-    (void)core_id;
-    return -1;
-#endif
-}
 
 // Enhanced worker thread function with affinity
 static void* worker_thread_with_affinity(void *arg) {
     worker_context_t *ctx = (worker_context_t*)arg;
-    vfm_core_context_t *core = ctx->core_ctx;
+    vfm_core_context_t *core __attribute__((unused)) = ctx->core_ctx;
     
     // Set thread affinity to specific core
     if (set_thread_affinity(pthread_self(), ctx->thread_id) == 0) {
@@ -2153,148 +2123,12 @@ int vfm_multicore_set_numa_node(vfm_multicore_state_t *mc_vm, uint32_t numa_node
 // Phase 3.1.4: NUMA-aware memory allocation
 // ============================================================================
 
-// Get NUMA topology information
-static int get_numa_node_count(void) {
-#ifdef VFM_PLATFORM_MACOS
-    // macOS doesn't expose NUMA topology directly
-    // But Apple Silicon has unified memory architecture
-    return 1;
-    
-#elif defined(__linux__)
-    // Linux: Check /sys/devices/system/node/ for NUMA nodes
-    // For simplicity, assume single NUMA node for now
-    // Real implementation would use libnuma
-    return 1;
-    
-#else
-    return 1;
-#endif
-}
 
-// Allocate memory on specific NUMA node
-static void* numa_alloc_on_node(size_t size, uint32_t numa_node, size_t alignment) {
-#ifdef VFM_PLATFORM_MACOS
-    // macOS: Use standard aligned allocation (unified memory architecture)
-    (void)numa_node; // Unused on macOS
-    if (alignment > 0) {
-        return aligned_alloc(alignment, size);
-    } else {
-        return malloc(size);
-    }
-    
-#elif defined(__linux__)
-    // Linux: Would use numa_alloc_onnode() from libnuma
-    // For now, fall back to standard allocation
-    (void)numa_node;
-    if (alignment > 0) {
-        return aligned_alloc(alignment, size);
-    } else {
-        return malloc(size);
-    }
-    
-#else
-    (void)numa_node;
-    if (alignment > 0) {
-        return aligned_alloc(alignment, size);
-    } else {
-        return malloc(size);
-    }
-#endif
-}
 
-// Free NUMA-allocated memory
-static void numa_free(void *ptr, size_t size) {
-#ifdef VFM_PLATFORM_MACOS
-    // macOS: Standard free
-    (void)size;
-    free(ptr);
-    
-#elif defined(__linux__)
-    // Linux: Would use numa_free() from libnuma
-    // For now, use standard free
-    (void)size;
-    free(ptr);
-    
-#else
-    (void)size;
-    free(ptr);
-#endif
-}
 
-// Get CPU to NUMA node mapping
-static uint32_t get_cpu_numa_node(uint32_t cpu_id) {
-#ifdef VFM_PLATFORM_MACOS
-    // macOS: Apple Silicon has unified memory
-    (void)cpu_id;
-    return 0;
-    
-#elif defined(__linux__)
-    // Linux: Would read /sys/devices/system/cpu/cpuX/numa_node
-    // For now, assume all CPUs on node 0
-    (void)cpu_id;
-    return 0;
-    
-#else
-    (void)cpu_id;
-    return 0;
-#endif
-}
 
-// Enhanced core context allocation with NUMA awareness
-static vfm_core_context_t* alloc_core_context_numa(uint32_t core_id, uint32_t numa_node) {
-    // Determine NUMA node for this core
-    uint32_t target_numa_node = (numa_node != UINT32_MAX) ? numa_node : get_cpu_numa_node(core_id);
-    
-    // Allocate core context on the target NUMA node
-    vfm_core_context_t *core_ctx = numa_alloc_on_node(sizeof(vfm_core_context_t), 
-                                                      target_numa_node, 
-                                                      VFM_CACHE_LINE_SIZE);
-    if (!core_ctx) return NULL;
-    
-    memset(core_ctx, 0, sizeof(vfm_core_context_t));
-    
-    // Allocate per-core stack on the same NUMA node with cache line alignment
-    core_ctx->stack_size = VFM_STACK_SIZE;
-    core_ctx->stack = numa_alloc_on_node(VFM_STACK_SIZE * sizeof(uint64_t), 
-                                        target_numa_node, 
-                                        128); // 128-byte alignment for cache efficiency
-    
-    if (!core_ctx->stack) {
-        numa_free(core_ctx, sizeof(vfm_core_context_t));
-        return NULL;
-    }
-    
-    core_ctx->core_id = core_id;
-    memset(&core_ctx->flow_stats, 0, sizeof(vfm_flow_stats_t));
-    
-    return core_ctx;
-}
 
-// Free NUMA-aware core context
-static void free_core_context_numa(vfm_core_context_t *core_ctx) {
-    if (!core_ctx) return;
-    
-    if (core_ctx->stack) {
-        numa_free(core_ctx->stack, VFM_STACK_SIZE * sizeof(uint64_t));
-    }
-    
-    numa_free(core_ctx, sizeof(vfm_core_context_t));
-}
 
-// Enhanced flow table allocation with NUMA awareness
-static vfm_flow_entry_t* alloc_flow_table_numa(uint32_t size, uint32_t numa_node) {
-    size_t table_size = size * sizeof(vfm_flow_entry_t);
-    
-    // Allocate flow table on specified NUMA node
-    vfm_flow_entry_t *flow_table = numa_alloc_on_node(table_size, numa_node, VFM_CACHE_LINE_SIZE);
-    
-    if (flow_table) {
-        // Initialize all atomic fields to zero
-        memset(flow_table, 0, table_size);
-    }
-    
-    return flow_table;
-}
 
 // ============================================================================
 // Phase 3.2: Adaptive JIT Optimization Implementation
@@ -2326,16 +2160,6 @@ static vfm_execution_profile_t* create_execution_profile(uint32_t instruction_co
     return profile;
 }
 
-// Free execution profile
-static void destroy_execution_profile(vfm_execution_profile_t *profile) {
-    if (!profile) return;
-    
-    free(profile->instruction_profiles);
-    free(profile->hot_paths);
-    free(profile->branch_hints.likely_taken);
-    free(profile->branch_hints.likely_not_taken);
-    free(profile);
-}
 
 // Update execution profile during runtime
 static void update_execution_profile(vfm_execution_profile_t *profile, uint32_t pc, 
@@ -2404,7 +2228,7 @@ static void analyze_packet_pattern(vfm_execution_profile_t *profile, const uint8
             
             // Track subnet patterns (simplified)
             uint32_t src_subnet = src_ip & 0xFFFFFF00; // /24
-            uint32_t dst_subnet = dst_ip & 0xFFFFFF00;
+            uint32_t dst_subnet __attribute__((unused)) = dst_ip & 0xFFFFFF00;
             
             // Update most common source/destination subnets (simplified tracking)
             if (profile->packet_patterns.common_src_subnet == 0) {

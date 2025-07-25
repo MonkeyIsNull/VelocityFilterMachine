@@ -80,14 +80,6 @@ static int vfl_emit_u64(vfl_compile_ctx_t *ctx, uint64_t value) {
     return 0;
 }
 
-// Emit 128-bit immediate value (for IPv6 addresses)
-static int vfl_emit_u128(vfl_compile_ctx_t *ctx, const uint8_t value[16]) {
-    if (vfl_ensure_capacity(ctx, 16) < 0) return -1;
-    for (int i = 0; i < 16; i++) {
-        ctx->bytecode[ctx->bytecode_pos++] = value[i];
-    }
-    return 0;
-}
 
 // Stack management
 static int vfl_push_stack(vfl_compile_ctx_t *ctx) {

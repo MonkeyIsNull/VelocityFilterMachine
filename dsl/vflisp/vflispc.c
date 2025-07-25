@@ -1,5 +1,5 @@
 #include "vflisp_types.h"
-#include "../../src/vfm.h"
+#include "../../include/vfm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

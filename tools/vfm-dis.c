@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <getopt.h>
-#include "../src/vfm.h"
+#include "vfm.h"
 
 // Disassembler configuration
 typedef struct {
