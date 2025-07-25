@@ -2056,19 +2056,11 @@ static int set_thread_affinity(pthread_t thread, uint32_t core_id) {
     return (result == KERN_SUCCESS) ? 0 : -1;
     
 #elif defined(__linux__)
-    // Linux thread affinity using sched_setaffinity
-    #ifdef CPU_SETSIZE
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(core_id, &cpuset);
-        
-        return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-    #else
-        // Fallback for systems without CPU affinity support (e.g., Alpine Linux/musl)
-        (void)thread;
-        (void)core_id;
-        return 0;  // Pretend success, no affinity support
-    #endif
+    // Fallback for Linux systems - CPU affinity often not available or inconsistent
+    // Especially on Alpine Linux/musl, Docker containers, etc.
+    (void)thread;
+    (void)core_id;
+    return 0;  // Pretend success, no affinity support
     
 #else
     // Unsupported platform

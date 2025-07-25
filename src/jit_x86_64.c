@@ -1050,6 +1050,12 @@ done:
 // Phase 3.2.3: Adaptive x86_64 JIT compilation with packet pattern optimization
 void* vfm_jit_compile_x86_64_adaptive(const uint8_t *program, uint32_t len, 
                                       vfm_execution_profile_t *profile) {
+    // Disable adaptive JIT on Linux due to incomplete implementation
+    #ifdef VFM_PLATFORM_LINUX
+        (void)profile;
+        return vfm_jit_compile_x86_64(program, len);
+    #endif
+    
     if (!profile) {
         // Fall back to regular compilation if no profile available
         return vfm_jit_compile_x86_64(program, len);

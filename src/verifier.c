@@ -514,7 +514,7 @@ void vfm_disassemble(const uint8_t *program, uint32_t len, char *output, size_t 
                 pos += snprintf(output + pos, output_size - pos, " %u", *(uint32_t*)&program[pc + 1]);
                 break;
             case VFM_FMT_IMM64:
-                pos += snprintf(output + pos, output_size - pos, " %llu", *(uint64_t*)&program[pc + 1]);
+                pos += snprintf(output + pos, output_size - pos, " %" PRIu64, *(uint64_t*)&program[pc + 1]);
                 break;
             default:
                 break;

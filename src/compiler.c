@@ -733,7 +733,7 @@ int vfm_to_xdp(const uint8_t *vfm_prog, uint32_t vfm_len, char *c_code, size_t c
                 vfm_pc += 8;
                 
                 pos += snprintf(c_code + pos, code_size - pos,
-                    "    stack[sp++] = %lluULL;\n", value);
+                    "    stack[sp++] = %" PRIu64 "ULL;\n", value);
                 break;
             }
             

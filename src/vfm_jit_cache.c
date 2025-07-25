@@ -435,14 +435,14 @@ void vfm_jit_cache_print_stats(void) {
     vfm_jit_cache_get_stats(&stats);
     
     printf("VFM JIT Cache Statistics:\n");
-    printf("  Cache Hits: %llu\n", stats.cache_hits);
-    printf("  Cache Misses: %llu\n", stats.cache_misses);
+    printf("  Cache Hits: %" PRIu64 "\n", stats.cache_hits);
+    printf("  Cache Misses: %" PRIu64 "\n", stats.cache_misses);
     printf("  Hit Ratio: %.2f%%\n", stats.cache_hit_ratio);
-    printf("  Total Compilations: %llu\n", stats.total_compilations);
+    printf("  Total Compilations: %" PRIu64 "\n", stats.total_compilations);
     printf("  Active Entries: %u\n", stats.active_entries);
-    printf("  Memory Used: %llu KB\n", stats.memory_used / 1024);
-    printf("  Memory Peak: %llu KB\n", stats.memory_peak / 1024);
-    printf("  Evictions: %llu\n", stats.evictions);
+    printf("  Memory Used: %" PRIu64 " KB\n", stats.memory_used / 1024);
+    printf("  Memory Peak: %" PRIu64 " KB\n", stats.memory_peak / 1024);
+    printf("  Evictions: %" PRIu64 "\n", stats.evictions);
     printf("  Avg Compile Time: %.2f ms\n", stats.avg_compile_time_ms);
 }
 

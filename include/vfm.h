@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <inttypes.h>
 
 // Platform-specific system includes
 #ifdef VFM_PLATFORM_LINUX
@@ -115,6 +116,7 @@ enum vfm_opcode {
     VFM_AND,     // Bitwise AND
     VFM_OR,      // Bitwise OR
     VFM_XOR,     // Bitwise XOR
+    VFM_AND32,   // 32-bit bitwise AND
     VFM_SHL,     // Shift left
     VFM_SHR,     // Shift right
 
@@ -551,6 +553,7 @@ __attribute__((unused)) static const char *vfm_opcode_names[] = {
     [VFM_AND]        = "AND",
     [VFM_OR]         = "OR",
     [VFM_XOR]        = "XOR",
+    [VFM_AND32]      = "AND32",
     [VFM_SHL]        = "SHL",
     [VFM_SHR]        = "SHR",
     [VFM_JMP]        = "JMP",
@@ -619,6 +622,7 @@ static const vfm_format_t vfm_opcode_format[] = {
     [VFM_AND]        = VFM_FMT_NONE,
     [VFM_OR]         = VFM_FMT_NONE,
     [VFM_XOR]        = VFM_FMT_NONE,
+    [VFM_AND32]      = VFM_FMT_NONE,
     [VFM_SHL]        = VFM_FMT_NONE,
     [VFM_SHR]        = VFM_FMT_NONE,
     [VFM_JMP]        = VFM_FMT_OFFSET16, // jump offset
@@ -948,6 +952,7 @@ static const char *vfm_opcode_names[] = {
     [VFM_AND]        = "AND",
     [VFM_OR]         = "OR",
     [VFM_XOR]        = "XOR",
+    [VFM_AND32]      = "AND32",
     [VFM_SHL]        = "SHL",
     [VFM_SHR]        = "SHR",
     [VFM_JMP]        = "JMP",
