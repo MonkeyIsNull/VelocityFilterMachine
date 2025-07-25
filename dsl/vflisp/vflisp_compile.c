@@ -59,6 +59,12 @@ static int vfl_emit_opcode(vfl_compile_ctx_t *ctx, uint8_t opcode) {
     return 0;
 }
 
+static int vfl_emit_u8(vfl_compile_ctx_t *ctx, uint8_t value) {
+    if (vfl_ensure_capacity(ctx, 1) < 0) return -1;
+    ctx->bytecode[ctx->bytecode_pos++] = value;
+    return 0;
+}
+
 static int vfl_emit_u16(vfl_compile_ctx_t *ctx, uint16_t value) {
     if (vfl_ensure_capacity(ctx, 2) < 0) return -1;
     ctx->bytecode[ctx->bytecode_pos++] = value & 0xFF;
@@ -70,6 +76,15 @@ static int vfl_emit_u64(vfl_compile_ctx_t *ctx, uint64_t value) {
     if (vfl_ensure_capacity(ctx, 8) < 0) return -1;
     for (int i = 0; i < 8; i++) {
         ctx->bytecode[ctx->bytecode_pos++] = (value >> (i * 8)) & 0xFF;
+    }
+    return 0;
+}
+
+// Emit 128-bit immediate value (for IPv6 addresses)
+static int vfl_emit_u128(vfl_compile_ctx_t *ctx, const uint8_t value[16]) {
+    if (vfl_ensure_capacity(ctx, 16) < 0) return -1;
+    for (int i = 0; i < 16; i++) {
+        ctx->bytecode[ctx->bytecode_pos++] = value[i];
     }
     return 0;
 }
@@ -96,37 +111,122 @@ static int vfl_pop_stack(vfl_compile_ctx_t *ctx) {
     return 0;
 }
 
-// Compile packet field access
+// Compile packet field access with IPv6 support
 static int vfl_compile_field(vfl_node_t *node, vfl_compile_ctx_t *ctx) {
     const vfl_field_info_t *info = node->data.field.field_info;
     
-    // Emit appropriate load instruction based on field size
-    switch (info->size) {
-        case 1:
-            if (vfl_emit_opcode(ctx, VFM_LD8) < 0) return -1;
-            break;
-        case 2:
-            if (vfl_emit_opcode(ctx, VFM_LD16) < 0) return -1;
-            break;
-        case 4:
-            if (vfl_emit_opcode(ctx, VFM_LD32) < 0) return -1;
-            break;
-        default:
-            snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Unsupported field size: %d", info->size);
-            return -1;
+    // Handle special IP version field
+    if (info->type == VFL_FIELD_IP_VERSION) {
+        // Use VFM_IP_VER opcode to get IP version (4 or 6)
+        if (vfl_emit_opcode(ctx, VFM_IP_VER) < 0) return -1;
+        return vfl_push_stack(ctx);
     }
     
-    // Emit offset
-    if (vfl_emit_u16(ctx, info->offset) < 0) return -1;
+    // Handle special IPv6 fields
+    if (info->type == VFL_FIELD_SRC_IP6 || info->type == VFL_FIELD_DST_IP6) {
+        // Use VFM_LD128 opcode for proper 128-bit IPv6 address loading
+        
+        uint16_t offset;
+        switch (info->type) {
+            case VFL_FIELD_SRC_IP6:
+                // IPv6 source address at offset 22 (14 + 8)
+                offset = 22;
+                break;
+                
+            case VFL_FIELD_DST_IP6:
+                // IPv6 destination address at offset 38 (14 + 24)
+                offset = 38;
+                break;
+                
+            default:
+                snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Unknown IPv6 field type %d", info->type);
+                return -1;
+        }
+        
+        // Emit VFM_LD128 opcode with offset
+        if (vfl_emit_opcode(ctx, VFM_LD128) < 0) return -1;
+        if (vfl_emit_u16(ctx, offset) < 0) return -1;
+        
+        // VFM_LD128 pushes high and low 64-bit values to stack
+        if (vfl_push_stack(ctx) < 0) return -1;  // High from LD128
+        return vfl_push_stack(ctx);              // Low from LD128
+    } else if (info->type >= VFL_FIELD_HAS_EXT_HDR && info->type <= VFL_FIELD_FRAG_FLAGS) {
+        // IPv6 extension header fields - use special opcode
+        if (vfl_emit_opcode(ctx, VFM_IPV6_EXT) < 0) return -1;
+        if (vfl_emit_u8(ctx, (uint8_t)info->type) < 0) return -1;
+    } else if (info->type == VFL_FIELD_SRC_PORT || info->type == VFL_FIELD_DST_PORT) {
+        // Transport fields may need dynamic offset calculation for IPv6
+        // For compile-time, we'll use a special approach that works for both IPv4 and IPv6
+        
+        // Emit a runtime field extraction opcode that handles dynamic offsets
+        if (vfl_emit_opcode(ctx, VFM_IPV6_EXT) < 0) return -1;
+        if (vfl_emit_u8(ctx, (uint8_t)info->type) < 0) return -1;
+    } else {
+        // Static offset fields (IPv4 and common fields)
+        // Emit appropriate load instruction based on field size
+        switch (info->size) {
+            case 1:
+                if (vfl_emit_opcode(ctx, VFM_LD8) < 0) return -1;
+                break;
+            case 2:
+                if (vfl_emit_opcode(ctx, VFM_LD16) < 0) return -1;
+                break;
+            case 4:
+                if (vfl_emit_opcode(ctx, VFM_LD32) < 0) return -1;
+                break;
+            case 16:
+                // 16-byte fields (IPv6) use two 64-bit loads for now
+                // This is handled in the dynamic offset section above
+                snprintf(ctx->error_msg, sizeof(ctx->error_msg), "16-byte static fields not supported in legacy mode");
+                return -1;
+            default:
+                snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Unsupported field size: %d", info->size);
+                return -1;
+        }
+        
+        // Emit offset
+        if (vfl_emit_u16(ctx, info->offset) < 0) return -1;
+    }
     
-    // Field access pushes one value onto stack
-    return vfl_push_stack(ctx);
+    // Field access pushes values onto stack
+    // IPv6 fields push two values (using two LD64 operations)
+    // Regular fields push one value
+    if (info->size == 16 && info->offset_calc != NULL && info->offset == 0) {
+        // IPv6 fields push two 64-bit values
+        if (vfl_push_stack(ctx) < 0) return -1;  // First 64-bit value
+        return vfl_push_stack(ctx);              // Second 64-bit value
+    } else {
+        // Regular fields push one value
+        return vfl_push_stack(ctx);
+    }
 }
 
 // Compile integer literal
 static int vfl_compile_integer(vfl_node_t *node, vfl_compile_ctx_t *ctx) {
     if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
     if (vfl_emit_u64(ctx, (uint64_t)node->data.integer) < 0) return -1;
+    return vfl_push_stack(ctx);
+}
+
+// Compile IPv6 address literal
+static int vfl_compile_ipv6(vfl_node_t *node, vfl_compile_ctx_t *ctx) {
+    // Convert IPv6 address to two 64-bit values (high and low)
+    uint64_t high = 0, low = 0;
+    for (int i = 0; i < 8; i++) {
+        high = (high << 8) | node->data.ipv6[i];
+    }
+    for (int i = 8; i < 16; i++) {
+        low = (low << 8) | node->data.ipv6[i];
+    }
+    
+    // Push high 64 bits first
+    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
+    if (vfl_emit_u64(ctx, high) < 0) return -1;
+    if (vfl_push_stack(ctx) < 0) return -1;
+    
+    // Push low 64 bits second
+    if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
+    if (vfl_emit_u64(ctx, low) < 0) return -1;
     return vfl_push_stack(ctx);
 }
 
@@ -150,6 +250,30 @@ static int vfl_compile_binary_op(vfl_node_t *node, vfl_compile_ctx_t *ctx, uint8
     return 0;
 }
 
+// Check if operands are IPv6 (128-bit) based on field types
+static bool vfl_is_ipv6_comparison(vfl_node_t *left, vfl_node_t *right) {
+    // Check if either operand is an IPv6 field
+    if (left->type == VFL_NODE_FIELD) {
+        vfl_field_type_t field_type = left->data.field.field_type;
+        if (field_type == VFL_FIELD_SRC_IP6 || field_type == VFL_FIELD_DST_IP6) {
+            return true;
+        }
+    }
+    if (right->type == VFL_NODE_FIELD) {
+        vfl_field_type_t field_type = right->data.field.field_type;
+        if (field_type == VFL_FIELD_SRC_IP6 || field_type == VFL_FIELD_DST_IP6) {
+            return true;
+        }
+    }
+    
+    // Check if either operand is an IPv6 literal
+    if (left->type == VFL_NODE_IPV6 || right->type == VFL_NODE_IPV6) {
+        return true;
+    }
+    
+    return false;
+}
+
 // Compile comparison operation - generates clean control flow pattern
 static int vfl_compile_comparison(vfl_node_t *node, vfl_compile_ctx_t *ctx, uint8_t jump_opcode) {
     if (node->data.list.count != 3) {
@@ -157,19 +281,59 @@ static int vfl_compile_comparison(vfl_node_t *node, vfl_compile_ctx_t *ctx, uint
         return -1;
     }
     
+    vfl_node_t *left = node->data.list.children[1];
+    vfl_node_t *right = node->data.list.children[2];
+    
+    // Determine if this is an IPv6 (128-bit) comparison
+    bool is_ipv6 = vfl_is_ipv6_comparison(left, right);
+    
     // Compile both arguments onto stack
-    if (vfl_compile_node(node->data.list.children[1], ctx) < 0) return -1;
-    if (vfl_compile_node(node->data.list.children[2], ctx) < 0) return -1;
+    if (vfl_compile_node(left, ctx) < 0) return -1;
+    if (vfl_compile_node(right, ctx) < 0) return -1;
+    
+    // Use appropriate comparison instruction based on operand type
+    uint8_t comparison_opcode;
+    if (is_ipv6) {
+        // Use 128-bit comparison opcodes for IPv6
+        switch (jump_opcode) {
+            case VFM_JEQ: comparison_opcode = VFM_EQ128; break;
+            case VFM_JNE: comparison_opcode = VFM_NE128; break;
+            case VFM_JGT: comparison_opcode = VFM_GT128; break;
+            case VFM_JLT: comparison_opcode = VFM_LT128; break;
+            case VFM_JGE: comparison_opcode = VFM_GE128; break;
+            case VFM_JLE: comparison_opcode = VFM_LE128; break;
+            default:
+                snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Unsupported IPv6 comparison opcode: %d", jump_opcode);
+                return -1;
+        }
+        
+        // Emit 128-bit comparison and adjust stack
+        if (vfl_emit_opcode(ctx, comparison_opcode) < 0) return -1;
+        
+        // 128-bit comparison consumes 4 stack entries (2 IPv6 addresses) and produces 1 result
+        if (vfl_pop_stack(ctx) < 0) return -1;  // Right operand low
+        if (vfl_pop_stack(ctx) < 0) return -1;  // Right operand high  
+        if (vfl_pop_stack(ctx) < 0) return -1;  // Left operand low
+        if (vfl_pop_stack(ctx) < 0) return -1;  // Left operand high
+        if (vfl_push_stack(ctx) < 0) return -1; // Comparison result
+        
+        return 0;
+    }
+    
+    // Use standard comparison instruction
+    comparison_opcode = jump_opcode;
     
     // Use VFM's native comparison with clean control flow
     // Jump to true branch if comparison succeeds
-    if (vfl_emit_opcode(ctx, jump_opcode) < 0) return -1;
+    if (vfl_emit_opcode(ctx, comparison_opcode) < 0) return -1;
     uint32_t true_jump_pos = ctx->bytecode_pos;
     if (vfl_emit_u16(ctx, 0) < 0) return -1;  // Will be patched
     
-    // The jump instruction consumes both operands from stack at runtime
-    if (vfl_pop_stack(ctx) < 0) return -1;
-    if (vfl_pop_stack(ctx) < 0) return -1;
+    // The jump instruction consumes operands from stack at runtime
+    // For stack tracking purposes, all comparisons consume 2 logical values
+    // regardless of whether they're IPv4 (64-bit) or IPv6 (128-bit)
+    if (vfl_pop_stack(ctx) < 0) return -1;  // Right operand
+    if (vfl_pop_stack(ctx) < 0) return -1;  // Left operand
     
     // False branch: push 0 and jump to end
     if (vfl_emit_opcode(ctx, VFM_PUSH) < 0) return -1;
@@ -470,6 +634,8 @@ static int vfl_compile_node(vfl_node_t *node, vfl_compile_ctx_t *ctx) {
     switch (node->type) {
         case VFL_NODE_INTEGER:
             return vfl_compile_integer(node, ctx);
+        case VFL_NODE_IPV6:
+            return vfl_compile_ipv6(node, ctx);
         case VFL_NODE_FIELD:
             return vfl_compile_field(node, ctx);
         case VFL_NODE_LIST:
@@ -499,6 +665,17 @@ int vfl_compile(vfl_node_t *ast, uint8_t **bytecode, uint32_t *bytecode_len, cha
         return -1;
     }
     
+    // Check final stack state - handle IPv6 case where 2 values might be left
+    if (ctx->stack_depth == 2) {
+        // Likely an IPv6 value at top level - drop the low part for boolean context
+        if (vfl_emit_opcode(ctx, VFM_POP) < 0) {
+            if (error_msg) snprintf(error_msg, error_msg_size, "Failed to emit POP for IPv6 boolean context");
+            vfl_compile_ctx_destroy(ctx);
+            return -1;
+        }
+        ctx->stack_depth--;
+    }
+    
     // Emit return instruction
     if (vfl_emit_opcode(ctx, VFM_RET) < 0) {
         if (error_msg) snprintf(error_msg, error_msg_size, "Failed to emit return instruction");
@@ -506,7 +683,6 @@ int vfl_compile(vfl_node_t *ast, uint8_t **bytecode, uint32_t *bytecode_len, cha
         return -1;
     }
     
-    // Check final stack state
     if (ctx->stack_depth != 1) {
         if (error_msg) snprintf(error_msg, error_msg_size, "Stack imbalance: expected 1, got %d", ctx->stack_depth);
         vfl_compile_ctx_destroy(ctx);

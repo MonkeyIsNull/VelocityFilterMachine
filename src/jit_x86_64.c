@@ -1,5 +1,4 @@
 #include "vfm.h"
-#include "opcodes.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -578,6 +577,91 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 break;
             }
             
+            case VFM_LD128: {
+                uint16_t offset = *(uint16_t*)&program[pc];
+                pc += 2;
+                
+                // Load 128-bit IPv6 address from packet as two 64-bit values
+                uint8_t reg_low = alloc_reg(&jit);
+                uint8_t reg_high = alloc_reg(&jit);
+                
+                // Load low 64 bits: mov reg_low, qword ptr [rsi + offset]
+                emit_mov_reg_mem(&jit, reg_low, RSI, offset);
+                // Load high 64 bits: mov reg_high, qword ptr [rsi + offset + 8]
+                emit_mov_reg_mem(&jit, reg_high, RSI, offset + 8);
+                
+                // Push both values on stack (low first, then high)
+                jit.stack_regs[jit.stack_depth++] = reg_low;
+                jit.stack_regs[jit.stack_depth++] = reg_high;
+                break;
+            }
+            
+            case VFM_PUSH128: {
+                // 128-bit immediate: 16 bytes (low 64 bits, then high 64 bits)
+                uint64_t low = *(uint64_t*)&program[pc];
+                uint64_t high = *(uint64_t*)&program[pc + 8];
+                pc += 16;
+                
+                uint8_t reg_low = alloc_reg(&jit);
+                uint8_t reg_high = alloc_reg(&jit);
+                
+                emit_mov_reg_imm64(&jit, reg_low, low);
+                emit_mov_reg_imm64(&jit, reg_high, high);
+                
+                // Push both values on stack (low first, then high)
+                jit.stack_regs[jit.stack_depth++] = reg_low;
+                jit.stack_regs[jit.stack_depth++] = reg_high;
+                break;
+            }
+            
+            case VFM_EQ128: {
+                if (jit.stack_depth >= 4) {
+                    // Pop two 128-bit values (4 64-bit registers total)
+                    uint8_t b_high = jit.stack_regs[--jit.stack_depth];
+                    uint8_t b_low = jit.stack_regs[--jit.stack_depth];
+                    uint8_t a_high = jit.stack_regs[--jit.stack_depth];
+                    uint8_t a_low = jit.stack_regs[--jit.stack_depth];
+                    
+                    // Compare low parts: cmp a_low, b_low
+                    emit_cmp_reg_reg(&jit, a_low, b_low);
+                    
+                    // Set result register to 0 initially
+                    uint8_t result_reg = alloc_reg(&jit);
+                    emit_mov_reg_imm64(&jit, result_reg, 0);
+                    
+                    // Jump if low parts not equal
+                    emit_jne_rel32(&jit, 20); // Skip high comparison
+                    
+                    // Compare high parts: cmp a_high, b_high
+                    emit_cmp_reg_reg(&jit, a_high, b_high);
+                    
+                    // Jump if high parts not equal
+                    emit_jne_rel32(&jit, 8); // Skip setting result to 1
+                    
+                    // Set result to 1 (equal)
+                    emit_mov_reg_imm64(&jit, result_reg, 1);
+                    
+                    // Free used registers
+                    free_reg(&jit, a_low); free_reg(&jit, a_high);
+                    free_reg(&jit, b_low); free_reg(&jit, b_high);
+                    
+                    // Push result
+                    jit.stack_regs[jit.stack_depth++] = result_reg;
+                }
+                break;
+            }
+            
+            case VFM_IPV6_EXT: {
+                uint8_t field_type = program[pc];
+                pc += 1;
+                
+                // For now, fall back to interpreter for IPv6 extension fields
+                // This is complex to implement in JIT, so we emit a call to interpreter
+                emit_mov_reg_imm64(&jit, RAX, -1); // Return error - fall back to interpreter
+                emit_epilogue(&jit);
+                goto done;
+            }
+            
             case VFM_RET: {
                 // Move return value to RAX
                 if (jit.stack_depth > 0) {
@@ -613,24 +697,4 @@ done:
     }
     
     return code;
-}
-
-// Free JIT compiled code
-void vfm_jit_free(void *code, size_t size) {
-    if (code) {
-        munmap(code, size);
-    }
-}
-
-// JIT function signature
-typedef uint64_t (*vfm_jit_func_t)(const uint8_t *packet, uint16_t packet_len);
-
-// Execute JIT compiled code
-uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len) {
-    if (!jit_code || !packet) {
-        return 0;
-    }
-    
-    vfm_jit_func_t func = (vfm_jit_func_t)jit_code;
-    return func(packet, packet_len);
 }

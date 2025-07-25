@@ -28,6 +28,7 @@ void vfl_node_destroy(vfl_node_t *node) {
             break;
         case VFL_NODE_INTEGER:
         case VFL_NODE_FIELD:
+        case VFL_NODE_IPV6:
             // No cleanup needed
             break;
     }
@@ -73,6 +74,13 @@ vfl_node_t* vfl_node_create_list(void) {
     return node;
 }
 
+vfl_node_t* vfl_node_create_ipv6(const uint8_t ipv6[16]) {
+    vfl_node_t *node = vfl_node_create(VFL_NODE_IPV6);
+    if (!node) return NULL;
+    memcpy(node->data.ipv6, ipv6, 16);
+    return node;
+}
+
 void vfl_node_list_append(vfl_node_t *list, vfl_node_t *child) {
     if (list->type != VFL_NODE_LIST) return;
     
@@ -111,6 +119,7 @@ const char* vfl_node_type_name(vfl_node_type_t type) {
         case VFL_NODE_SYMBOL: return "SYMBOL";
         case VFL_NODE_LIST: return "LIST";
         case VFL_NODE_FIELD: return "FIELD";
+        case VFL_NODE_IPV6: return "IPV6";
         default: return "UNKNOWN";
     }
 }
@@ -150,7 +159,58 @@ void vfl_node_print(const vfl_node_t *node, int indent) {
                 vfl_node_print(node->data.list.children[i], indent + 1);
             }
             break;
+        case VFL_NODE_IPV6:
+            printf("IPV6: %02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                   node->data.ipv6[0], node->data.ipv6[1], node->data.ipv6[2], node->data.ipv6[3],
+                   node->data.ipv6[4], node->data.ipv6[5], node->data.ipv6[6], node->data.ipv6[7],
+                   node->data.ipv6[8], node->data.ipv6[9], node->data.ipv6[10], node->data.ipv6[11],
+                   node->data.ipv6[12], node->data.ipv6[13], node->data.ipv6[14], node->data.ipv6[15]);
+            break;
     }
+}
+
+// IPv6 address parsing helper
+static int vfl_parse_ipv6_address(const char *addr_str, size_t len, uint8_t result[16]) {
+    // Simple IPv6 address parser - handles basic formats like ::1, 2001:db8::1, etc.
+    memset(result, 0, 16);
+    
+    if (len == 0) return -1;
+    
+    // Handle special case of "::" (all zeros)
+    if (len == 2 && addr_str[0] == ':' && addr_str[1] == ':') {
+        return 0;  // result is already all zeros
+    }
+    
+    // Handle "::1" (loopback)
+    if (len == 3 && strncmp(addr_str, "::1", 3) == 0) {
+        result[15] = 1;  // ::1 has 1 in the last byte
+        return 0;
+    }
+    
+    // For now, only support these simple cases
+    // TODO: Implement full IPv6 address parsing
+    return -1;
+}
+
+// Check if a character sequence looks like an IPv6 address
+static bool vfl_looks_like_ipv6(const char *str, size_t pos, size_t len) {
+    // Look for patterns with colons that indicate IPv6
+    bool has_colon = false;
+    size_t colon_count = 0;
+    
+    for (size_t i = pos; i < len && i < pos + 40; i++) {  // IPv6 max length ~39 chars
+        char c = str[i];
+        if (c == ':') {
+            has_colon = true;
+            colon_count++;
+        } else if (c == ' ' || c == ')' || c == '\t' || c == '\n') {
+            break;  // End of potential IPv6 address
+        } else if (!isxdigit(c)) {
+            return false;  // Invalid character for IPv6
+        }
+    }
+    
+    return has_colon && colon_count >= 1;
 }
 
 // Lexer functions
@@ -224,6 +284,27 @@ static vfl_token_t vfl_next_token(vfl_parse_ctx_t *ctx) {
                 ctx->pos += len;
                 ctx->column += len;
                 token.type = VFL_TOKEN_INTEGER;
+            } else if (c == ':' && vfl_looks_like_ipv6(ctx->input, ctx->pos, ctx->input_len)) {
+                // Parse IPv6 address
+                size_t start = ctx->pos;
+                while (ctx->pos < ctx->input_len) {
+                    char cur = ctx->input[ctx->pos];
+                    if (isxdigit(cur) || cur == ':') {
+                        ctx->pos++;
+                        ctx->column++;
+                    } else {
+                        break;  // End of IPv6 address
+                    }
+                }
+                
+                size_t len = ctx->pos - start;
+                if (vfl_parse_ipv6_address(&ctx->input[start], len, token.value.ipv6) < 0) {
+                    token.type = VFL_TOKEN_ERROR;
+                    snprintf(ctx->error_msg, sizeof(ctx->error_msg), "Invalid IPv6 address at line %d", ctx->line);
+                    return token;
+                }
+                
+                token.type = VFL_TOKEN_IPV6;
             } else if (isalpha(c) || c == '-' || c == '_' || c == '=' || c == '!' || c == '>' || c == '<' ||
                        c == '+' || c == '*' || c == '/' || c == '%' || c == '&' || c == '|' || c == '^') {
                 // Parse symbol
@@ -263,6 +344,7 @@ static void vfl_token_destroy(vfl_token_t *token) {
     if (token->type == VFL_TOKEN_SYMBOL) {
         free(token->value.symbol);
     }
+    // IPv6 tokens don't need cleanup - they store bytes directly
 }
 
 // Parser functions
@@ -305,6 +387,13 @@ static vfl_node_t* vfl_parse_list(vfl_parse_ctx_t *ctx) {
             ctx->pos -= strlen(token.value.symbol);
             ctx->column -= strlen(token.value.symbol);
             vfl_token_destroy(&token);
+        } else if (token.type == VFL_TOKEN_IPV6) {
+            // Rewind to start of IPv6 token
+            // Find the start by scanning backwards for the first colon or hex digit
+            while (ctx->pos > 0 && (isxdigit(ctx->input[ctx->pos - 1]) || ctx->input[ctx->pos - 1] == ':')) {
+                ctx->pos--;
+                ctx->column--;
+            }
         }
         
         vfl_node_t *child = vfl_parse_expression(ctx);
@@ -339,6 +428,9 @@ static vfl_node_t* vfl_parse_expression(vfl_parse_ctx_t *ctx) {
             
         case VFL_TOKEN_INTEGER:
             return vfl_node_create_integer(token.value.integer);
+            
+        case VFL_TOKEN_IPV6:
+            return vfl_node_create_ipv6(token.value.ipv6);
             
         case VFL_TOKEN_SYMBOL: {
             // Check if it's a packet field

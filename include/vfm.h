@@ -132,6 +132,28 @@ enum vfm_opcode {
     VFM_LT,      // Less than comparison
     VFM_GE,      // Greater or equal comparison
     VFM_LE,      // Less or equal comparison
+    
+    // IPv6 support opcodes (128-bit operations)
+    VFM_LD128,   // Load 128-bit value from packet (IPv6 addresses)
+    VFM_PUSH128, // Push 128-bit immediate value
+    VFM_EQ128,   // Compare 128-bit values for equality
+    VFM_NE128,   // Compare 128-bit values for inequality
+    VFM_GT128,   // Compare 128-bit values (greater than)
+    VFM_LT128,   // Compare 128-bit values (less than)
+    VFM_GE128,   // Compare 128-bit values (greater or equal)
+    VFM_LE128,   // Compare 128-bit values (less or equal)
+    VFM_AND128,  // 128-bit bitwise AND (for IPv6 subnet masks)
+    VFM_OR128,   // 128-bit bitwise OR
+    VFM_XOR128,  // 128-bit bitwise XOR
+    VFM_JEQ128,  // Jump if 128-bit values equal
+    VFM_JNE128,  // Jump if 128-bit values not equal
+    VFM_JGT128,  // Jump if first 128-bit value > second
+    VFM_JLT128,  // Jump if first 128-bit value < second
+    VFM_JGE128,  // Jump if first 128-bit value >= second
+    VFM_JLE128,  // Jump if first 128-bit value <= second
+    VFM_IP_VER,  // Get IP version from packet (4 or 6)
+    VFM_IPV6_EXT,// Extract IPv6 extension header field
+    VFM_HASH6,   // Hash IPv6 5-tuple
 
     VFM_OPCODE_MAX
 };
@@ -143,6 +165,7 @@ typedef enum {
     VFM_FMT_IMM16,     // 16-bit immediate
     VFM_FMT_IMM32,     // 32-bit immediate
     VFM_FMT_IMM64,     // 64-bit immediate
+    VFM_FMT_IMM128,    // 128-bit immediate (for IPv6 addresses)
     VFM_FMT_OFFSET16   // 16-bit offset (for jumps and packet access)
 } vfm_format_t;
 
@@ -191,6 +214,12 @@ typedef struct vfm_state {
     vfm_flow_entry_t *flow_table;
     uint32_t flow_table_mask;  // Size - 1 for fast modulo
     uint32_t _pad4;  // Padding
+    
+    // JIT compilation cache
+    void *jit_code;             // Compiled native code (NULL if not compiled)
+    size_t jit_code_size;       // Size of JIT code for cleanup
+    bool jit_enabled;           // Whether to attempt JIT compilation
+    uint8_t _pad_jit[7];        // Padding to 8 bytes
     
     // Platform-specific optimization hints
     struct {
@@ -384,7 +413,27 @@ static const char *vfm_opcode_names[] = {
     [VFM_GT]         = "GT",
     [VFM_LT]         = "LT",
     [VFM_GE]         = "GE",
-    [VFM_LE]         = "LE"
+    [VFM_LE]         = "LE",
+    [VFM_LD128]      = "LD128",
+    [VFM_PUSH128]    = "PUSH128",
+    [VFM_EQ128]      = "EQ128",
+    [VFM_NE128]      = "NE128",
+    [VFM_GT128]      = "GT128",
+    [VFM_LT128]      = "LT128",
+    [VFM_GE128]      = "GE128",
+    [VFM_LE128]      = "LE128",
+    [VFM_AND128]     = "AND128",
+    [VFM_OR128]      = "OR128",
+    [VFM_XOR128]     = "XOR128",
+    [VFM_JEQ128]     = "JEQ128",
+    [VFM_JNE128]     = "JNE128",
+    [VFM_JGT128]     = "JGT128",
+    [VFM_JLT128]     = "JLT128",
+    [VFM_JGE128]     = "JGE128",
+    [VFM_JLE128]     = "JLE128",
+    [VFM_IP_VER]     = "IP_VER",
+    [VFM_IPV6_EXT]   = "IPV6_EXT",
+    [VFM_HASH6]      = "HASH6"
 };
 
 // Opcode format information
@@ -427,7 +476,27 @@ static const vfm_format_t vfm_opcode_format[] = {
     [VFM_GT]         = VFM_FMT_NONE,     // stack-based comparison
     [VFM_LT]         = VFM_FMT_NONE,     // stack-based comparison
     [VFM_GE]         = VFM_FMT_NONE,     // stack-based comparison
-    [VFM_LE]         = VFM_FMT_NONE      // stack-based comparison
+    [VFM_LE]         = VFM_FMT_NONE,     // stack-based comparison
+    [VFM_LD128]      = VFM_FMT_OFFSET16, // packet offset for 128-bit load
+    [VFM_PUSH128]    = VFM_FMT_IMM128,   // 128-bit immediate value
+    [VFM_EQ128]      = VFM_FMT_NONE,     // compares two 128-bit values on stack
+    [VFM_NE128]      = VFM_FMT_NONE,
+    [VFM_GT128]      = VFM_FMT_NONE,
+    [VFM_LT128]      = VFM_FMT_NONE,
+    [VFM_GE128]      = VFM_FMT_NONE,
+    [VFM_LE128]      = VFM_FMT_NONE,
+    [VFM_AND128]     = VFM_FMT_NONE,
+    [VFM_OR128]      = VFM_FMT_NONE,
+    [VFM_XOR128]     = VFM_FMT_NONE,
+    [VFM_JEQ128]     = VFM_FMT_OFFSET16, // jump offset
+    [VFM_JNE128]     = VFM_FMT_OFFSET16,
+    [VFM_JGT128]     = VFM_FMT_OFFSET16,
+    [VFM_JLT128]     = VFM_FMT_OFFSET16,
+    [VFM_JGE128]     = VFM_FMT_OFFSET16,
+    [VFM_JLE128]     = VFM_FMT_OFFSET16,
+    [VFM_IP_VER]     = VFM_FMT_NONE,     // pushes IP version (4 or 6)
+    [VFM_IPV6_EXT]   = VFM_FMT_IMM8,     // extracts IPv6 extension header field (field type as immediate)
+    [VFM_HASH6]      = VFM_FMT_NONE      // computes IPv6 5-tuple hash
 };
 
 // Get instruction size in bytes
@@ -440,6 +509,7 @@ static inline uint32_t vfm_instruction_size(uint8_t opcode) {
         case VFM_FMT_IMM16:    return 3;
         case VFM_FMT_IMM32:    return 5;
         case VFM_FMT_IMM64:    return 9;
+        case VFM_FMT_IMM128:   return 17;  // 1 byte opcode + 16 bytes IPv6 address
         case VFM_FMT_OFFSET16: return 3;
         default:               return 0;
     }

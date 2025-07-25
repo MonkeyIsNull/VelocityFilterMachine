@@ -65,7 +65,8 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # VFLisp sources
 VFLISP_SRCS = $(VFLISP_DIR)/vflisp_parser.c \
-              $(VFLISP_DIR)/vflisp_compile.c
+              $(VFLISP_DIR)/vflisp_compile.c \
+              $(VFLISP_DIR)/vflisp_util.c
 
 VFLISP_OBJS = $(VFLISP_SRCS:.c=.o)
 
@@ -93,7 +94,7 @@ BENCH_BINS = $(BENCH_SRCS:.c=)
 all: libvfm.a tools vflisp
 
 # Static library
-libvfm.a: $(LIB_OBJS)
+libvfm.a: $(LIB_OBJS) $(VFLISP_OBJS)
 	ar rcs $@ $^
 
 # Object files
