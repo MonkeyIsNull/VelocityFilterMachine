@@ -1,5 +1,4 @@
 #include "vfm.h"
-#include "opcodes.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -142,10 +141,23 @@ static int verify_cfg(vfm_verifier_t *v, uint32_t pc, int32_t stack_depth) {
             case VFM_PUSH:
             case VFM_DUP:
             case VFM_HASH5:
+            case VFM_HASH6:
             case VFM_CSUM:
             case VFM_PARSE:
             case VFM_FLOW_LOAD:
+            case VFM_IP_VER:
+            case VFM_IPV6_EXT:
                 stack_depth++;
+                break;
+                
+            case VFM_LD128:
+                // VFM_LD128 pushes 2 x 64-bit values on the stack (high, low)
+                stack_depth += 2;
+                break;
+                
+            case VFM_PUSH128:
+                // VFM_PUSH128 also pushes 2 x 64-bit values on the stack
+                stack_depth += 2;
                 break;
                 
             case VFM_POP:
@@ -176,6 +188,26 @@ static int verify_cfg(vfm_verifier_t *v, uint32_t pc, int32_t stack_depth) {
             case VFM_SHR:
             case VFM_FLOW_STORE:
                 stack_depth -= 2;
+                stack_depth++;
+                break;
+                
+            case VFM_EQ128:
+            case VFM_NE128:
+            case VFM_GT128:
+            case VFM_LT128:
+            case VFM_GE128:
+            case VFM_LE128:
+                // 128-bit comparisons consume 4 stack entries (2 IPv6 addresses = 4 x 64-bit values), push 1 result
+                stack_depth -= 4;
+                stack_depth++;
+                break;
+                
+            case VFM_AND128:
+            case VFM_OR128:
+            case VFM_XOR128:
+                // 128-bit bitwise operations consume 4 stack entries (2 IPv6 addresses = 4 x 64-bit values), push 2 result values
+                stack_depth -= 4;
+                stack_depth += 2;
                 stack_depth++;
                 break;
                 
@@ -240,6 +272,41 @@ static int verify_cfg(vfm_verifier_t *v, uint32_t pc, int32_t stack_depth) {
                 break;
             }
             
+            case VFM_JEQ128:
+            case VFM_JNE128:
+            case VFM_JGT128:
+            case VFM_JLT128:
+            case VFM_JGE128:
+            case VFM_JLE128: {
+                int16_t offset = *(int16_t*)&v->program[pc + 1];
+                uint32_t target = (uint32_t)((int32_t)next_pc + offset);
+                
+                // Check jump bounds
+                if (target >= v->program_len) {
+                    return VFM_ERROR_VERIFICATION_FAILED;
+                }
+                
+                // 128-bit conditional jumps consume 4 stack entries (2 IPv6 addresses = 4 x 64-bit values)
+                stack_depth -= 4;
+                
+                // Check for back edge
+                if (target <= pc) {
+                    if (v->back_edge_count >= MAX_BACK_EDGES) {
+                        return VFM_ERROR_VERIFICATION_FAILED;
+                    }
+                    v->back_edges[v->back_edge_count++] = target;
+                }
+                
+                // Verify both paths
+                int result = verify_cfg(v, target, stack_depth);
+                if (result != VFM_SUCCESS) {
+                    return result;
+                }
+                
+                // Continue with fall-through path
+                break;
+            }
+            
             default:
                 return VFM_ERROR_INVALID_OPCODE;
         }
@@ -266,14 +333,31 @@ static int verify_instruction(vfm_verifier_t *v, uint32_t pc, uint8_t opcode) {
         case VFM_LD8:
         case VFM_LD16:
         case VFM_LD32:
-        case VFM_LD64: {
+        case VFM_LD64:
+        case VFM_LD128: {
             // Check packet offset bounds
             uint16_t offset = *(uint16_t*)&v->program[pc + 1];
             
             // We can't verify packet bounds statically, but we can check
             // that the offset is reasonable - reject obviously invalid offsets
-            if (offset > 1500) {  // Reasonable MTU limit
+            uint16_t field_size = 1;  // Default for LD8
+            switch (opcode) {
+                case VFM_LD16: field_size = 2; break;
+                case VFM_LD32: field_size = 4; break;
+                case VFM_LD64: field_size = 8; break;
+                case VFM_LD128: field_size = 16; break;
+            }
+            
+            if (offset > 1500 - field_size) {  // Reasonable MTU limit minus field size
                 return VFM_ERROR_VERIFICATION_FAILED;
+            }
+            break;
+        }
+        
+        case VFM_PUSH128: {
+            // Validate 128-bit immediate value bounds
+            if (pc + 17 > v->program_len) {
+                return VFM_ERROR_INVALID_PROGRAM;
             }
             break;
         }
@@ -289,7 +373,13 @@ static int verify_instruction(vfm_verifier_t *v, uint32_t pc, uint8_t opcode) {
         case VFM_JGT:
         case VFM_JLT:
         case VFM_JGE:
-        case VFM_JLE: {
+        case VFM_JLE:
+        case VFM_JEQ128:
+        case VFM_JNE128:
+        case VFM_JGT128:
+        case VFM_JLT128:
+        case VFM_JGE128:
+        case VFM_JLE128: {
             // Jump offset bounds already checked in verify_cfg
             break;
         }

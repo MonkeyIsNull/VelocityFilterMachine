@@ -1,5 +1,5 @@
 #include "vfm.h"
-#include "opcodes.h"
+#include "../dsl/vflisp/vflisp_types.h"
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -11,7 +11,7 @@
     #include <mach/vm_map.h>
 #endif
 
-// Hash function for 5-tuple (optimized for common use cases)
+// Hash function for IPv4 5-tuple (optimized for common use cases)
 static VFM_ALWAYS_INLINE uint64_t hash_5tuple(const uint8_t *packet, uint16_t len) {
     if (VFM_UNLIKELY(len < 34)) return 0;  // Too short for IP header
     
@@ -30,6 +30,43 @@ static VFM_ALWAYS_INLINE uint64_t hash_5tuple(const uint8_t *packet, uint16_t le
     hash ^= src_port; hash *= 1099511628211ULL;
     hash ^= dst_port; hash *= 1099511628211ULL;
     hash ^= protocol; hash *= 1099511628211ULL;
+    
+    return hash;
+}
+
+// Hash function for IPv6 5-tuple
+static VFM_ALWAYS_INLINE uint64_t hash_6tuple(const uint8_t *packet, uint16_t len) {
+    if (VFM_UNLIKELY(len < 54)) return 0;  // Too short for IPv6 header + ports
+    
+    // IPv6 header starts at offset 14 (Ethernet header)
+    const uint8_t *ipv6_hdr = packet + 14;
+    
+    // Extract IPv6 addresses (16 bytes each)
+    const uint8_t *src_ip6 = ipv6_hdr + 8;   // Source IPv6 at offset 8
+    const uint8_t *dst_ip6 = ipv6_hdr + 24;  // Destination IPv6 at offset 24
+    
+    // Next header field and ports
+    uint8_t next_hdr = ipv6_hdr[6];
+    uint16_t src_port = *(uint16_t*)(packet + 54);  // After IPv6 header
+    uint16_t dst_port = *(uint16_t*)(packet + 56);
+    
+    // FNV-1a hash with IPv6 addresses
+    uint64_t hash = 14695981039346656037ULL;
+    
+    // Hash IPv6 source address (16 bytes)
+    for (int i = 0; i < 16; i++) {
+        hash ^= src_ip6[i]; hash *= 1099511628211ULL;
+    }
+    
+    // Hash IPv6 destination address (16 bytes)
+    for (int i = 0; i < 16; i++) {
+        hash ^= dst_ip6[i]; hash *= 1099511628211ULL;
+    }
+    
+    // Hash ports and protocol
+    hash ^= src_port; hash *= 1099511628211ULL;
+    hash ^= dst_port; hash *= 1099511628211ULL;
+    hash ^= next_hdr; hash *= 1099511628211ULL;
     
     return hash;
 }
@@ -96,6 +133,25 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
         (var) = vm->stack[vm->hot.sp]; \
     } while(0)
 
+// 128-bit stack operations
+#define STACK128_PUSH(val) \
+    do { \
+        if (VFM_UNLIKELY(vm->sp128 >= vm->stack128_size - 1)) { \
+            vm->hot.error = VFM_ERROR_STACK_OVERFLOW; \
+            return VFM_ERROR_STACK_OVERFLOW; \
+        } \
+        vm->stack128[++vm->sp128] = (val); \
+    } while(0)
+
+#define STACK128_POP(var) \
+    do { \
+        if (VFM_UNLIKELY(vm->sp128 == 0)) { \
+            vm->hot.error = VFM_ERROR_STACK_UNDERFLOW; \
+            return VFM_ERROR_STACK_UNDERFLOW; \
+        } \
+        (var) = vm->stack128[vm->sp128--]; \
+    } while(0)
+
 // Instruction limit check
 #define INSN_LIMIT_CHECK() \
     do { \
@@ -112,8 +168,18 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
     vm->hot.packet_len = packet_len;
     vm->hot.pc = 0;
     vm->hot.sp = 0;
+    vm->sp128 = 0;  // Reset 128-bit stack pointer
     vm->hot.insn_count = 0;
     vm->hot.error = VFM_SUCCESS;
+    
+    // Try JIT execution first if available
+    if (vm->jit_code) {
+        uint64_t result = vfm_jit_execute(vm->jit_code, packet, packet_len);
+        if (result != (uint64_t)-1) {  // -1 indicates JIT failure, fall back to interpreter
+            return (result != 0) ? VFM_SUCCESS : VFM_ERROR_VERIFICATION_FAILED;
+        }
+        // JIT failed, fall back to interpreter
+    }
     
     // Computed goto dispatch table for maximum performance
     static const void *dispatch_table[] = {
@@ -149,7 +215,27 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
         [VFM_JLE]        = &&op_jle,
         [VFM_NOT]        = &&op_not,
         [VFM_NEG]        = &&op_neg,
-        [VFM_MOD]        = &&op_mod
+        [VFM_MOD]        = &&op_mod,
+        [VFM_LD128]      = &&op_ld128,
+        [VFM_PUSH128]    = &&op_push128,
+        [VFM_EQ128]      = &&op_eq128,
+        [VFM_NE128]      = &&op_ne128,
+        [VFM_GT128]      = &&op_gt128,
+        [VFM_LT128]      = &&op_lt128,
+        [VFM_GE128]      = &&op_ge128,
+        [VFM_LE128]      = &&op_le128,
+        [VFM_AND128]     = &&op_and128,
+        [VFM_OR128]      = &&op_or128,
+        [VFM_XOR128]     = &&op_xor128,
+        [VFM_JEQ128]     = &&op_jeq128,
+        [VFM_JNE128]     = &&op_jne128,
+        [VFM_JGT128]     = &&op_jgt128,
+        [VFM_JLT128]     = &&op_jlt128,
+        [VFM_JGE128]     = &&op_jge128,
+        [VFM_JLE128]     = &&op_jle128,
+        [VFM_IP_VER]     = &&op_ip_ver,
+        [VFM_IPV6_EXT]   = &&op_ipv6_ext,
+        [VFM_HASH6]      = &&op_hash6
     };
     
     // Dispatch to first instruction
@@ -491,6 +577,321 @@ op_mod: {
     STACK_PUSH(a % b);
     DISPATCH();
 }
+
+// IPv6 opcode implementations
+op_ld128: {
+    INSN_LIMIT_CHECK();
+    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    BOUNDS_CHECK(offset, 16);
+    vfm_u128_t val = vfm_u128_from_bytes(vm->packet + offset);
+    // Push as two 64-bit values for compatibility with existing stack operations
+    STACK_PUSH(val.high);  // Push high 64 bits first
+    STACK_PUSH(val.low);   // Push low 64 bits second
+    DISPATCH();
+}
+
+op_push128: {
+    INSN_LIMIT_CHECK();
+    vfm_u128_t val = vfm_u128_from_bytes(&vm->program[vm->hot.pc]);
+    vm->hot.pc += 16;
+    // Push as two 64-bit values for compatibility with existing stack operations
+    STACK_PUSH(val.high);  // Push high 64 bits first
+    STACK_PUSH(val.low);   // Push low 64 bits second
+    DISPATCH();
+}
+
+op_eq128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_eq(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_ne128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_ne(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_gt128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_gt(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_lt128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_lt(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_ge128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_ge(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_le128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    uint64_t result = vfm_u128_le(a, b) ? 1 : 0;
+    STACK_PUSH(result);
+    DISPATCH();
+}
+
+op_and128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    vfm_u128_t result = vfm_u128_and(a, b);
+    STACK_PUSH(result.high);
+    STACK_PUSH(result.low);
+    DISPATCH();
+}
+
+op_or128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    vfm_u128_t result = vfm_u128_or(a, b);
+    STACK_PUSH(result.high);
+    STACK_PUSH(result.low);
+    DISPATCH();
+}
+
+op_xor128: {
+    INSN_LIMIT_CHECK();
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    vfm_u128_t result = vfm_u128_xor(a, b);
+    STACK_PUSH(result.high);
+    STACK_PUSH(result.low);
+    DISPATCH();
+}
+
+op_jeq128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_eq(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_jne128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_ne(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_jgt128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_gt(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_jlt128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_lt(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_jge128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_ge(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_jle128: {
+    INSN_LIMIT_CHECK();
+    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    vm->hot.pc += 2;
+    // Pop two 128-bit values (4 64-bit stack entries total)
+    uint64_t b_low, b_high, a_low, a_high;
+    STACK_POP(b_low);   // Second operand low bits
+    STACK_POP(b_high);  // Second operand high bits
+    STACK_POP(a_low);   // First operand low bits
+    STACK_POP(a_high);  // First operand high bits
+    
+    vfm_u128_t a = {a_low, a_high};
+    vfm_u128_t b = {b_low, b_high};
+    if (vfm_u128_le(a, b)) {
+        vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
+    }
+    DISPATCH();
+}
+
+op_hash6: {
+    INSN_LIMIT_CHECK();
+    uint64_t hash = hash_6tuple(vm->packet, vm->hot.packet_len);
+    STACK_PUSH(hash);
+    DISPATCH();
+}
+
+op_ip_ver: {
+    INSN_LIMIT_CHECK();
+    // Check IP version field at offset 14 (after Ethernet header)
+    if (VFM_UNLIKELY(vm->hot.packet_len < 15)) {
+        STACK_PUSH(0);  // Invalid packet
+    } else {
+        uint8_t version = (vm->packet[14] >> 4) & 0x0F;
+        STACK_PUSH((uint64_t)version);
+    }
+    DISPATCH();
+}
+
+op_ipv6_ext: {
+    INSN_LIMIT_CHECK();
+    uint8_t field_type = vm->program[vm->hot.pc];
+    vm->hot.pc += 1;
+    
+    // Extract IPv6 extension header field value
+    uint64_t value = vfl_extract_ipv6_ext_field((vfl_field_type_t)field_type, 
+                                                vm->packet, vm->hot.packet_len);
+    STACK_PUSH(value);
+    DISPATCH();
+}
 }
 
 // VM management functions
@@ -500,7 +901,7 @@ vfm_state_t* vfm_create(void) {
     
     memset(vm, 0, sizeof(vfm_state_t));
     
-    // Allocate stack
+    // Allocate regular stack
     vm->stack = aligned_alloc(16, VFM_MAX_STACK * sizeof(uint64_t));
     if (!vm->stack) {
         free(vm);
@@ -508,8 +909,22 @@ vfm_state_t* vfm_create(void) {
     }
     vm->stack_size = VFM_MAX_STACK;
     
+    // Allocate 128-bit stack
+    vm->stack128 = aligned_alloc(16, VFM_MAX_STACK * sizeof(vfm_u128_t));
+    if (!vm->stack128) {
+        free(vm->stack);
+        free(vm);
+        return NULL;
+    }
+    vm->stack128_size = VFM_MAX_STACK;
+    
     // Set default limits
     vm->hot.insn_limit = VFM_MAX_INSN;
+    
+    // Enable JIT compilation by default
+    vm->jit_enabled = true;
+    vm->jit_code = NULL;
+    vm->jit_code_size = 0;
     
     // Enable platform-specific optimizations
     vfm_enable_optimizations(vm);
@@ -522,6 +937,17 @@ void vfm_destroy(vfm_state_t *vm) {
     
     if (vm->stack) {
         free(vm->stack);
+    }
+    
+    if (vm->stack128) {
+        free(vm->stack128);
+    }
+    
+    // Clean up JIT code
+    if (vm->jit_code) {
+        vfm_jit_free(vm->jit_code, vm->jit_code_size);
+        vm->jit_code = NULL;
+        vm->jit_code_size = 0;
     }
     
     if (vm->flow_table) {
@@ -542,8 +968,55 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
         return result;
     }
     
+    // Clean up any existing JIT code
+    if (vm->jit_code) {
+        vfm_jit_free(vm->jit_code, vm->jit_code_size);
+        vm->jit_code = NULL;
+        vm->jit_code_size = 0;
+    }
+    
     vm->program = program;
     vm->program_len = len;
+    
+    // Check if program contains opcodes that are not JIT compatible
+    bool jit_compatible = true;
+    for (uint32_t pc = 0; pc < len; ) {
+        uint8_t opcode = program[pc];
+        
+        // Check for opcodes not supported by JIT
+        if (opcode == VFM_IP_VER || opcode == VFM_IPV6_EXT || opcode == VFM_HASH6 ||
+            opcode == VFM_LD128 || opcode == VFM_PUSH128 || 
+            opcode == VFM_EQ128 || opcode == VFM_NE128 ||
+            opcode == VFM_GT128 || opcode == VFM_LT128 || opcode == VFM_GE128 || opcode == VFM_LE128 ||
+            opcode == VFM_AND128 || opcode == VFM_OR128 || opcode == VFM_XOR128 ||
+            opcode == VFM_JEQ128 || opcode == VFM_JNE128 || 
+            opcode == VFM_JGT128 || opcode == VFM_JLT128 || opcode == VFM_JGE128 || opcode == VFM_JLE128) {
+            jit_compatible = false;
+            break;
+        }
+        
+        uint32_t insn_size = vfm_instruction_size(opcode);
+        if (insn_size == 0) break;
+        pc += insn_size;
+    }
+    
+    // Attempt JIT compilation if enabled and compatible
+    if (vm->jit_enabled && jit_compatible) {
+        #ifdef __aarch64__
+        extern bool vfm_jit_available_arm64(void);
+        if (vfm_jit_available_arm64()) {
+            vm->jit_code = vfm_jit_compile_arm64(program, len);
+            if (vm->jit_code) {
+                vm->jit_code_size = 4096; // ARM64 JIT uses fixed page size
+            }
+        }
+        #elif defined(__x86_64__)
+        vm->jit_code = vfm_jit_compile_x86_64(program, len);
+        if (vm->jit_code) {
+            vm->jit_code_size = len * 32; // Conservative estimate used in JIT
+        }
+        #endif
+    }
     
     return VFM_SUCCESS;
 }
@@ -623,4 +1096,28 @@ const char* vfm_error_string(vfm_error_t error) {
         case VFM_ERROR_VERIFICATION_FAILED: return "Verification failed";
         default: return "Unknown error";
     }
+}
+
+// Platform-independent JIT wrapper functions
+void vfm_jit_free(void *code, size_t size) {
+    if (code) {
+        #ifdef _WIN32
+        VirtualFree(code, 0, MEM_RELEASE);
+        #else
+        munmap(code, size);
+        #endif
+    }
+}
+
+// JIT function signature
+typedef uint64_t (*vfm_jit_func_t)(const uint8_t *packet, uint16_t packet_len);
+
+// Execute JIT compiled code
+uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len) {
+    if (!jit_code || !packet) {
+        return 0;
+    }
+    
+    vfm_jit_func_t func = (vfm_jit_func_t)jit_code;
+    return func(packet, packet_len);
 }
