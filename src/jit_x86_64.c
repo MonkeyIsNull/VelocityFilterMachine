@@ -422,52 +422,116 @@ static void emit_sete_reg(x86_64_jit_t *jit, uint8_t reg) {
     emit_sete_reg8(jit, reg);
 }
 
-static void emit_vpcmpeqd_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
+// XMM instruction stubs for Linux compatibility
+static void emit_vmovdqu_xmm_mem(x86_64_jit_t *jit, uint8_t dst, uint8_t base, int32_t offset) {
     #ifdef VFM_PLATFORM_LINUX
-        // Stub implementation for Linux - AVX2 not supported
-        (void)jit; (void)dst; (void)src1; (void)src2;
-    #else
-        // Full AVX2 implementation would go here on other platforms
-        (void)jit; (void)dst; (void)src1; (void)src2;
-    #endif
-}
-
-static void emit_vmovdqu_ymm_mem(x86_64_jit_t *jit, uint8_t dst, uint8_t base, int32_t offset) {
-    #ifdef VFM_PLATFORM_LINUX
-        // Stub implementation for Linux - AVX2 not supported
         (void)jit; (void)dst; (void)base; (void)offset;
     #else
-        // Full AVX2 implementation would go here on other platforms
         (void)jit; (void)dst; (void)base; (void)offset;
     #endif
 }
 
-static void emit_vpmovmskb_reg_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src) {
+static void emit_vpcmpeqb_xmm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
     #ifdef VFM_PLATFORM_LINUX
-        // Stub implementation for Linux - AVX2 not supported
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #else
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #endif
+}
+
+static void emit_vpmovmskb_reg_xmm(x86_64_jit_t *jit, uint8_t reg, uint8_t xmm) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)reg; (void)xmm;
+    #else
+        (void)jit; (void)reg; (void)xmm;
+    #endif
+}
+
+static void emit_movdqu_xmm_mem(x86_64_jit_t *jit, uint8_t dst, uint8_t base, int32_t offset) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)dst; (void)base; (void)offset;
+    #else
+        (void)jit; (void)dst; (void)base; (void)offset;
+    #endif
+}
+
+static void emit_pcmpeqb_xmm(x86_64_jit_t *jit, uint8_t dst, uint8_t src) {
+    #ifdef VFM_PLATFORM_LINUX
         (void)jit; (void)dst; (void)src;
     #else
-        // Full AVX2 implementation would go here on other platforms
         (void)jit; (void)dst; (void)src;
+    #endif
+}
+
+static void emit_pmovmskb_reg_xmm(x86_64_jit_t *jit, uint8_t reg, uint8_t xmm) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)reg; (void)xmm;
+    #else
+        (void)jit; (void)reg; (void)xmm;
+    #endif
+}
+
+// Memory and arithmetic instruction stubs
+static void emit_prefetcht0_mem(x86_64_jit_t *jit, uint8_t base, int32_t offset) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)base; (void)offset;
+    #else
+        (void)jit; (void)base; (void)offset;
+    #endif
+}
+
+static void emit_mov_mem32_reg(x86_64_jit_t *jit, uint8_t base, int32_t offset, uint8_t reg) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)base; (void)offset; (void)reg;
+    #else
+        (void)jit; (void)base; (void)offset; (void)reg;
+    #endif
+}
+
+static void emit_add_reg_imm(x86_64_jit_t *jit, uint8_t reg, int32_t imm) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)reg; (void)imm;
+    #else
+        (void)jit; (void)reg; (void)imm;
+    #endif
+}
+
+static void emit_andn_reg_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #else
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #endif
+}
+
+static void emit_and_reg_mem32(x86_64_jit_t *jit, uint8_t reg, uint8_t base, int32_t offset) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)reg; (void)base; (void)offset;
+    #else
+        (void)jit; (void)reg; (void)base; (void)offset;
+    #endif
+}
+
+static void emit_nop(x86_64_jit_t *jit) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit;
+    #else
+        (void)jit;
     #endif
 }
 
 static void emit_mov_reg_mem32(x86_64_jit_t *jit, uint8_t dst, uint8_t base, int32_t offset) {
     #ifdef VFM_PLATFORM_LINUX
-        // Stub implementation for Linux compatibility
         (void)jit; (void)dst; (void)base; (void)offset;
     #else
-        // Full implementation would go here on other platforms
         (void)jit; (void)dst; (void)base; (void)offset;
     #endif
 }
 
 static void emit_cmp_reg_mem32(x86_64_jit_t *jit, uint8_t reg, uint8_t base, int32_t offset) {
     #ifdef VFM_PLATFORM_LINUX
-        // Stub implementation for Linux compatibility
         (void)jit; (void)reg; (void)base; (void)offset;
     #else
-        // Full implementation would go here on other platforms
         (void)jit; (void)reg; (void)base; (void)offset;
     #endif
 }
@@ -525,6 +589,7 @@ static void detect_cpu_capabilities(x86_64_caps_t *caps) {
 // VEX prefix encoding for AVX2 instructions
 static void emit_vex3(x86_64_jit_t *jit, uint8_t rxb, uint8_t map_select, 
                       uint8_t w_vvvv_l_pp) {
+    (void)map_select; // Currently unused but kept for future extension
     emit_byte(jit, 0xC4);  // 3-byte VEX prefix
     emit_byte(jit, rxb);   // RXB and map_select
     emit_byte(jit, w_vvvv_l_pp);
@@ -1067,6 +1132,7 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
             case VFM_IPV6_EXT: {
                 uint8_t field_type = program[pc];
                 pc += 1;
+                (void)field_type; // Currently unused in JIT implementation
                 
                 // For now, fall back to interpreter for IPv6 extension fields
                 // This is complex to implement in JIT, so we emit a call to interpreter
