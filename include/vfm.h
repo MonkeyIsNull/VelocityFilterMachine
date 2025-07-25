@@ -19,6 +19,13 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
+// Platform-specific system includes
+#ifdef VFM_PLATFORM_LINUX
+    #define _GNU_SOURCE
+    #include <sched.h>
+    #include <unistd.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -527,7 +534,7 @@ static inline vfm_u128_t vfm_u128_xor(vfm_u128_t a, vfm_u128_t b) {
 }
 
 // Opcode names for debugging (stub implementation)
-static const char *vfm_opcode_names[] = {
+__attribute__((unused)) static const char *vfm_opcode_names[] = {
     [VFM_LD8]        = "LD8",
     [VFM_LD16]       = "LD16",
     [VFM_LD32]       = "LD32",
@@ -771,36 +778,36 @@ typedef struct vfm_batch {
     uint32_t count;
 } vfm_batch_t;
 
-// Platform-specific timing functions
+// Platform-specific timing functions - unified to always return uint64_t nanoseconds
 #ifdef VFM_PLATFORM_MACOS
     #include <mach/mach_time.h>
-    typedef uint64_t vfm_time_t;
     
-    static inline vfm_time_t vfm_get_time(void) {
-        return mach_absolute_time();
-    }
-    
-    static inline double vfm_time_to_ns(vfm_time_t time) {
+    static inline uint64_t vfm_get_time(void) {
         static mach_timebase_info_data_t timebase = {0};
         if (timebase.denom == 0) {
             mach_timebase_info(&timebase);
         }
-        return (double)time * timebase.numer / timebase.denom;
+        uint64_t abs_time = mach_absolute_time();
+        return abs_time * timebase.numer / timebase.denom;
     }
 #else
     #include <time.h>
-    typedef struct timespec vfm_time_t;
+    #ifndef _GNU_SOURCE
+        #define _GNU_SOURCE
+    #endif
+    #include <unistd.h>
     
-    static inline vfm_time_t vfm_get_time(void) {
-        vfm_time_t ts;
+    static inline uint64_t vfm_get_time(void) {
+        struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return ts;
-    }
-    
-    static inline double vfm_time_to_ns(vfm_time_t time) {
-        return time.tv_sec * 1000000000.0 + time.tv_nsec;
+        return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
     }
 #endif
+
+// Convert nanosecond timestamp to double for calculations
+static inline double vfm_time_to_ns(uint64_t time) {
+    return (double)time;
+}
 
 // Public API declarations
 

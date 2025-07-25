@@ -72,4 +72,8 @@ CLAUDE.md
 *.db
 # Ignore accidentally created top-level binary
 /ristretto
+dsl/vflisp/vflispc
+tools/vfm-asm
+tools/vfm-dis
+tools/vfm-test
 

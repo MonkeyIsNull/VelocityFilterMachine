@@ -529,7 +529,7 @@ op_push: {
 
 op_pop: {
     INSN_LIMIT_CHECK();
-    uint64_t dummy;
+    uint64_t dummy __attribute__((unused));
     STACK_POP(dummy);
     DISPATCH();
 }
@@ -1388,7 +1388,7 @@ int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
 void vfm_flow_table_destroy(vfm_state_t *vm) {
     if (!vm || !vm->hot.flow_table) return;
     
-    size_t table_size = (vm->hot.flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
+    size_t table_size __attribute__((unused)) = (vm->hot.flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
     
     #ifdef VFM_PLATFORM_MACOS
         munmap(vm->hot.flow_table, table_size);
@@ -1855,7 +1855,7 @@ void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm) {
     
     // Cleanup shared flow table
     if (mc_vm->flow_table) {
-        size_t table_size = (mc_vm->flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
+        size_t table_size __attribute__((unused)) = (mc_vm->flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
         #ifdef VFM_PLATFORM_MACOS
             munmap(mc_vm->flow_table, table_size);
         #else
