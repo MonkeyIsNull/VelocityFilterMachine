@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -364,7 +366,7 @@ static void assemble_instruction(assembler_t *asm_state, const opcode_info_t *op
             }
             uint64_t value = parse_number(asm_state, token->text);
             if (value > 0xFFFF) {
-                asm_error(asm_state, "Value %llu too large for 16-bit immediate", value);
+                asm_error(asm_state, "Value %" PRIu64 " too large for 16-bit immediate", value);
                 return;
             }
             emit_u16(asm_state, (uint16_t)value);
@@ -381,7 +383,7 @@ static void assemble_instruction(assembler_t *asm_state, const opcode_info_t *op
             }
             uint64_t value = parse_number(asm_state, token->text);
             if (value > 0xFFFFFFFF) {
-                asm_error(asm_state, "Value %llu too large for 32-bit immediate", value);
+                asm_error(asm_state, "Value %" PRIu64 " too large for 32-bit immediate", value);
                 return;
             }
             emit_u32(asm_state, (uint32_t)value);
@@ -410,7 +412,7 @@ static void assemble_instruction(assembler_t *asm_state, const opcode_info_t *op
                 // Direct offset
                 uint64_t value = parse_number(asm_state, token->text);
                 if (value > 0xFFFF) {
-                    asm_error(asm_state, "Jump offset %llu too large", value);
+                    asm_error(asm_state, "Jump offset %" PRIu64 " too large", value);
                     return;
                 }
                 emit_u16(asm_state, (uint16_t)value);

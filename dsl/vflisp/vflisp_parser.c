@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L  /* For strdup */
 #include "vflisp_types.h"
 #include <stdio.h>
 #include <stdlib.h>
