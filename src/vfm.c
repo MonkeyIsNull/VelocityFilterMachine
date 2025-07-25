@@ -9,7 +9,13 @@
 #ifdef VFM_PLATFORM_MACOS
     #include <mach/mach.h>
     #include <mach/vm_map.h>
+    #include <mach/mach_time.h>
+#else
+    #include <time.h>
 #endif
+
+// Forward declarations for JIT cache integration
+static uint64_t get_timestamp_ns(void);
 
 // Hash function for IPv4 5-tuple (optimized for common use cases)
 static VFM_ALWAYS_INLINE uint64_t hash_5tuple(const uint8_t *packet, uint16_t len) {
@@ -34,8 +40,98 @@ static VFM_ALWAYS_INLINE uint64_t hash_5tuple(const uint8_t *packet, uint16_t le
     return hash;
 }
 
-// Hash function for IPv6 5-tuple
-static VFM_ALWAYS_INLINE uint64_t hash_6tuple(const uint8_t *packet, uint16_t len) {
+// Platform-specific SIMD includes
+#ifdef __aarch64__
+    #include <arm_neon.h>
+#elif defined(__x86_64__) && defined(__AVX2__)
+    #include <immintrin.h>
+#endif
+
+// Cross-platform SIMD IPv6 hash optimization
+#ifdef __aarch64__
+// ARM64 NEON optimized IPv6 hash
+static VFM_ALWAYS_INLINE uint64_t hash_6tuple_neon(const uint8_t *packet, uint16_t len) {
+    if (VFM_UNLIKELY(len < 54)) return 0;
+    
+    const uint8_t *ipv6_hdr = packet + 14;
+    const uint8_t *src_ip6 = ipv6_hdr + 8;
+    const uint8_t *dst_ip6 = ipv6_hdr + 24;
+    
+    // Load IPv6 addresses as 128-bit vectors
+    uint8x16_t src_vec = vld1q_u8(src_ip6);
+    uint8x16_t dst_vec = vld1q_u8(dst_ip6);
+    
+    // FNV-1a constants
+    const uint64_t FNV_PRIME = 1099511628211ULL;
+    const uint64_t FNV_OFFSET = 14695981039346656037ULL;
+    
+    // Parallel processing of source and destination addresses
+    // XOR source and destination vectors
+    uint8x16_t combined = veorq_u8(src_vec, dst_vec);
+    
+    // Convert to 64-bit lanes for hash computation
+    uint64x2_t hash_vec = vreinterpretq_u64_u8(combined);
+    uint64_t hash = FNV_OFFSET;
+    
+    // Process both 64-bit halves
+    hash ^= vgetq_lane_u64(hash_vec, 0);
+    hash *= FNV_PRIME;
+    hash ^= vgetq_lane_u64(hash_vec, 1);
+    hash *= FNV_PRIME;
+    
+    // Hash ports and protocol
+    uint8_t next_hdr = ipv6_hdr[6];
+    uint16_t src_port = *(uint16_t*)(packet + 54);
+    uint16_t dst_port = *(uint16_t*)(packet + 56);
+    
+    hash ^= src_port; hash *= FNV_PRIME;
+    hash ^= dst_port; hash *= FNV_PRIME;
+    hash ^= next_hdr; hash *= FNV_PRIME;
+    
+    return hash;
+}
+#elif defined(__x86_64__) && defined(__AVX2__)
+// x86_64 AVX2 optimized IPv6 hash
+static VFM_ALWAYS_INLINE uint64_t hash_6tuple_avx2(const uint8_t *packet, uint16_t len) {
+    if (VFM_UNLIKELY(len < 54)) return 0;
+    
+    const uint8_t *ipv6_hdr = packet + 14;
+    const uint8_t *src_ip6 = ipv6_hdr + 8;
+    const uint8_t *dst_ip6 = ipv6_hdr + 24;
+    
+    // Load IPv6 addresses as 128-bit vectors (using first 16 bytes of 256-bit register)
+    __m128i src_vec = _mm_loadu_si128((const __m128i*)src_ip6);
+    __m128i dst_vec = _mm_loadu_si128((const __m128i*)dst_ip6);
+    
+    // XOR source and destination
+    __m128i combined = _mm_xor_si128(src_vec, dst_vec);
+    
+    // Extract 64-bit components for hash computation
+    uint64_t hash = 14695981039346656037ULL;
+    const uint64_t FNV_PRIME = 1099511628211ULL;
+    
+    // Process both 64-bit halves
+    hash ^= _mm_extract_epi64(combined, 0);
+    hash *= FNV_PRIME;
+    hash ^= _mm_extract_epi64(combined, 1);
+    hash *= FNV_PRIME;
+    
+    // Hash ports and protocol
+    uint8_t next_hdr = ipv6_hdr[6];
+    uint16_t src_port = *(uint16_t*)(packet + 54);
+    uint16_t dst_port = *(uint16_t*)(packet + 56);
+    
+    hash ^= src_port; hash *= FNV_PRIME;
+    hash ^= dst_port; hash *= FNV_PRIME;
+    hash ^= next_hdr; hash *= FNV_PRIME;
+    
+    return hash;
+}
+#endif
+
+#if !defined(__aarch64__) && !(defined(__x86_64__) && defined(__AVX2__))
+// Scalar fallback IPv6 hash (original implementation)
+static VFM_ALWAYS_INLINE uint64_t hash_6tuple_scalar(const uint8_t *packet, uint16_t len) {
     if (VFM_UNLIKELY(len < 54)) return 0;  // Too short for IPv6 header + ports
     
     // IPv6 header starts at offset 14 (Ethernet header)
@@ -70,13 +166,34 @@ static VFM_ALWAYS_INLINE uint64_t hash_6tuple(const uint8_t *packet, uint16_t le
     
     return hash;
 }
+#endif
+
+// Cross-platform IPv6 hash function with automatic SIMD dispatch
+static VFM_ALWAYS_INLINE uint64_t hash_6tuple(const uint8_t *packet, uint16_t len) {
+#ifdef __aarch64__
+    return hash_6tuple_neon(packet, len);
+#elif defined(__x86_64__) && defined(__AVX2__)
+    return hash_6tuple_avx2(packet, len);
+#else
+    return hash_6tuple_scalar(packet, len);
+#endif
+}
+
+// Public hash function wrappers for testing and benchmarking
+uint64_t vfm_hash_ipv4_5tuple(const uint8_t *packet, uint16_t len) {
+    return hash_5tuple(packet, len);
+}
+
+uint64_t vfm_hash_ipv6_5tuple(const uint8_t *packet, uint16_t len) {
+    return hash_6tuple(packet, len);
+}
 
 // Flow table operations
 static VFM_ALWAYS_INLINE uint64_t flow_table_get(vfm_state_t *vm, uint64_t key) {
-    if (VFM_UNLIKELY(!vm->flow_table)) return 0;
+    if (VFM_UNLIKELY(!vm->hot.flow_table)) return 0;
     
-    uint32_t index = key & vm->flow_table_mask;
-    vfm_flow_entry_t *entry = &vm->flow_table[index];
+    uint32_t index = key & vm->hot.flow_table_mask;
+    vfm_flow_entry_t *entry = &vm->hot.flow_table[index];
     
     if (VFM_LIKELY(entry->key == key)) {
         return entry->value;
@@ -86,10 +203,10 @@ static VFM_ALWAYS_INLINE uint64_t flow_table_get(vfm_state_t *vm, uint64_t key) 
 }
 
 static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint64_t value) {
-    if (VFM_UNLIKELY(!vm->flow_table)) return;
+    if (VFM_UNLIKELY(!vm->hot.flow_table)) return;
     
-    uint32_t index = key & vm->flow_table_mask;
-    vfm_flow_entry_t *entry = &vm->flow_table[index];
+    uint32_t index = key & vm->hot.flow_table_mask;
+    vfm_flow_entry_t *entry = &vm->hot.flow_table[index];
     
     entry->key = key;
     entry->value = value;
@@ -108,11 +225,11 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
 // Stack operations - inlined for performance
 #define STACK_PUSH(val) \
     do { \
-        if (VFM_UNLIKELY(vm->hot.sp >= vm->stack_size - 1)) { \
+        if (VFM_UNLIKELY(vm->hot.sp >= vm->hot.stack_size - 1)) { \
             vm->hot.error = VFM_ERROR_STACK_OVERFLOW; \
             return VFM_ERROR_STACK_OVERFLOW; \
         } \
-        vm->stack[++vm->hot.sp] = (val); \
+        vm->hot.stack[++vm->hot.sp] = (val); \
     } while(0)
 
 #define STACK_POP(var) \
@@ -121,7 +238,7 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
             vm->hot.error = VFM_ERROR_STACK_UNDERFLOW; \
             return VFM_ERROR_STACK_UNDERFLOW; \
         } \
-        (var) = vm->stack[vm->hot.sp--]; \
+        (var) = vm->hot.stack[vm->hot.sp--]; \
     } while(0)
 
 #define STACK_TOP(var) \
@@ -130,26 +247,26 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
             vm->hot.error = VFM_ERROR_STACK_UNDERFLOW; \
             return VFM_ERROR_STACK_UNDERFLOW; \
         } \
-        (var) = vm->stack[vm->hot.sp]; \
+        (var) = vm->hot.stack[vm->hot.sp]; \
     } while(0)
 
 // 128-bit stack operations
 #define STACK128_PUSH(val) \
     do { \
-        if (VFM_UNLIKELY(vm->sp128 >= vm->stack128_size - 1)) { \
+        if (VFM_UNLIKELY(vm->hot.sp128 >= vm->hot.stack128_size - 1)) { \
             vm->hot.error = VFM_ERROR_STACK_OVERFLOW; \
             return VFM_ERROR_STACK_OVERFLOW; \
         } \
-        vm->stack128[++vm->sp128] = (val); \
+        vm->hot.stack128[++vm->hot.sp128] = (val); \
     } while(0)
 
 #define STACK128_POP(var) \
     do { \
-        if (VFM_UNLIKELY(vm->sp128 == 0)) { \
+        if (VFM_UNLIKELY(vm->hot.sp128 == 0)) { \
             vm->hot.error = VFM_ERROR_STACK_UNDERFLOW; \
             return VFM_ERROR_STACK_UNDERFLOW; \
         } \
-        (var) = vm->stack128[vm->sp128--]; \
+        (var) = vm->hot.stack128[vm->hot.sp128--]; \
     } while(0)
 
 // Instruction limit check
@@ -164,17 +281,17 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
 // Main execution function with computed goto
 int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
     // Set up packet data
-    vm->packet = packet;
+    vm->hot.packet = packet;
     vm->hot.packet_len = packet_len;
     vm->hot.pc = 0;
     vm->hot.sp = 0;
-    vm->sp128 = 0;  // Reset 128-bit stack pointer
+    vm->hot.sp128 = 0;  // Reset 128-bit stack pointer
     vm->hot.insn_count = 0;
     vm->hot.error = VFM_SUCCESS;
     
     // Try JIT execution first if available
-    if (vm->jit_code) {
-        uint64_t result = vfm_jit_execute(vm->jit_code, packet, packet_len);
+    if (vm->cold.jit_code) {
+        uint64_t result = vfm_jit_execute(vm->cold.jit_code, packet, packet_len);
         if (result != (uint64_t)-1) {  // -1 indicates JIT failure, fall back to interpreter
             return (result != 0) ? VFM_SUCCESS : VFM_ERROR_VERIFICATION_FAILED;
         }
@@ -238,14 +355,28 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
         [VFM_HASH6]      = &&op_hash6
     };
     
-    // Dispatch to first instruction
+    // Dispatch to first instruction with intelligent prefetching
     #define DISPATCH() \
         do { \
-            if (VFM_UNLIKELY(vm->hot.pc >= vm->program_len)) { \
+            if (VFM_UNLIKELY(vm->hot.pc >= vm->hot.program_len)) { \
                 vm->hot.error = VFM_ERROR_INVALID_PROGRAM; \
                 return VFM_ERROR_INVALID_PROGRAM; \
             } \
-            uint8_t opcode = vm->program[vm->hot.pc++]; \
+            uint8_t opcode = vm->hot.program[vm->hot.pc++]; \
+            \
+            /* Strategic prefetching for better pipeline performance */ \
+            if (vm->cold.hints.use_prefetch) { \
+                uint32_t prefetch_distance = vm->cold.hints.prefetch_distance; \
+                /* Prefetch next instructions ahead */ \
+                if (vm->hot.pc + prefetch_distance < vm->hot.program_len) { \
+                    VFM_PREFETCH(&vm->hot.program[vm->hot.pc + prefetch_distance], 0, 3); \
+                } \
+                /* Prefetch stack area for upcoming operations */ \
+                if (vm->hot.sp + 2 < vm->hot.stack_size) { \
+                    VFM_PREFETCH(&vm->hot.stack[vm->hot.sp + 2], 1, 2); \
+                } \
+            } \
+            \
             if (VFM_UNLIKELY(opcode >= VFM_OPCODE_MAX)) { \
                 vm->hot.error = VFM_ERROR_INVALID_OPCODE; \
                 return VFM_ERROR_INVALID_OPCODE; \
@@ -258,48 +389,54 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
     // Instruction implementations
 op_ld8: {
     INSN_LIMIT_CHECK();
-    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    uint16_t offset = *(uint16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     BOUNDS_CHECK(offset, 1);
-    uint8_t val = vm->packet[offset];
+    
+    // Prefetch nearby packet data for potential sequential access
+    if (vm->cold.hints.use_prefetch && offset + 64 < vm->hot.packet_len) {
+        VFM_PREFETCH(&vm->hot.packet[offset + 64], 0, 1);
+    }
+    
+    uint8_t val = vm->hot.packet[offset];
     STACK_PUSH(val);
     DISPATCH();
 }
 
 op_ld16: {
     INSN_LIMIT_CHECK();
-    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    uint16_t offset = *(uint16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     BOUNDS_CHECK(offset, 2);
-    uint16_t val = ntohs(*(uint16_t*)(vm->packet + offset));
+    uint16_t val = ntohs(*(uint16_t*)(vm->hot.packet + offset));
     STACK_PUSH(val);
     DISPATCH();
 }
 
 op_ld32: {
     INSN_LIMIT_CHECK();
-    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    uint16_t offset = *(uint16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     BOUNDS_CHECK(offset, 4);
-    uint32_t val = ntohl(*(uint32_t*)(vm->packet + offset));
+    uint32_t val = ntohl(*(uint32_t*)(vm->hot.packet + offset));
     STACK_PUSH(val);
     DISPATCH();
 }
 
 op_ld64: {
     INSN_LIMIT_CHECK();
-    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    uint16_t offset = *(uint16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     BOUNDS_CHECK(offset, 8);
-    uint64_t val = ((uint64_t)ntohl(*(uint32_t*)(vm->packet + offset)) << 32) |
-                   ntohl(*(uint32_t*)(vm->packet + offset + 4));
+    uint64_t val = ((uint64_t)ntohl(*(uint32_t*)(vm->hot.packet + offset)) << 32) |
+                   ntohl(*(uint32_t*)(vm->hot.packet + offset + 4));
     STACK_PUSH(val);
     DISPATCH();
 }
 
 op_push: {
     INSN_LIMIT_CHECK();
-    uint64_t val = *(uint64_t*)&vm->program[vm->hot.pc];
+    uint64_t val = *(uint64_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 8;
     STACK_PUSH(val);
     DISPATCH();
@@ -326,9 +463,9 @@ op_swap: {
         vm->hot.error = VFM_ERROR_STACK_UNDERFLOW;
         return VFM_ERROR_STACK_UNDERFLOW;
     }
-    uint64_t tmp = vm->stack[vm->hot.sp];
-    vm->stack[vm->hot.sp] = vm->stack[vm->hot.sp - 1];
-    vm->stack[vm->hot.sp - 1] = tmp;
+    uint64_t tmp = vm->hot.stack[vm->hot.sp];
+    vm->hot.stack[vm->hot.sp] = vm->hot.stack[vm->hot.sp - 1];
+    vm->hot.stack[vm->hot.sp - 1] = tmp;
     DISPATCH();
 }
 
@@ -419,7 +556,7 @@ op_shr: {
 
 op_jmp: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     vm->hot.pc = (uint32_t)((int32_t)vm->hot.pc + offset);
     DISPATCH();
@@ -427,7 +564,7 @@ op_jmp: {
 
 op_jeq: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -440,7 +577,7 @@ op_jeq: {
 
 op_jne: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -453,7 +590,7 @@ op_jne: {
 
 op_jgt: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -466,7 +603,7 @@ op_jgt: {
 
 op_jlt: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -479,7 +616,7 @@ op_jlt: {
 
 op_jge: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -492,7 +629,7 @@ op_jge: {
 
 op_jle: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     uint64_t b, a;
     STACK_POP(b);
@@ -512,7 +649,7 @@ op_ret: {
 
 op_hash5: {
     INSN_LIMIT_CHECK();
-    uint64_t hash = hash_5tuple(vm->packet, vm->hot.packet_len);
+    uint64_t hash = hash_5tuple(vm->hot.packet, vm->hot.packet_len);
     STACK_PUSH(hash);
     DISPATCH();
 }
@@ -581,10 +718,10 @@ op_mod: {
 // IPv6 opcode implementations
 op_ld128: {
     INSN_LIMIT_CHECK();
-    uint16_t offset = *(uint16_t*)&vm->program[vm->hot.pc];
+    uint16_t offset = *(uint16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     BOUNDS_CHECK(offset, 16);
-    vfm_u128_t val = vfm_u128_from_bytes(vm->packet + offset);
+    vfm_u128_t val = vfm_u128_from_bytes(vm->hot.packet + offset);
     // Push as two 64-bit values for compatibility with existing stack operations
     STACK_PUSH(val.high);  // Push high 64 bits first
     STACK_PUSH(val.low);   // Push low 64 bits second
@@ -593,7 +730,7 @@ op_ld128: {
 
 op_push128: {
     INSN_LIMIT_CHECK();
-    vfm_u128_t val = vfm_u128_from_bytes(&vm->program[vm->hot.pc]);
+    vfm_u128_t val = vfm_u128_from_bytes(&vm->hot.program[vm->hot.pc]);
     vm->hot.pc += 16;
     // Push as two 64-bit values for compatibility with existing stack operations
     STACK_PUSH(val.high);  // Push high 64 bits first
@@ -750,7 +887,7 @@ op_xor128: {
 
 op_jeq128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -769,7 +906,7 @@ op_jeq128: {
 
 op_jne128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -788,7 +925,7 @@ op_jne128: {
 
 op_jgt128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -807,7 +944,7 @@ op_jgt128: {
 
 op_jlt128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -826,7 +963,7 @@ op_jlt128: {
 
 op_jge128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -845,7 +982,7 @@ op_jge128: {
 
 op_jle128: {
     INSN_LIMIT_CHECK();
-    int16_t offset = *(int16_t*)&vm->program[vm->hot.pc];
+    int16_t offset = *(int16_t*)&vm->hot.program[vm->hot.pc];
     vm->hot.pc += 2;
     // Pop two 128-bit values (4 64-bit stack entries total)
     uint64_t b_low, b_high, a_low, a_high;
@@ -864,7 +1001,15 @@ op_jle128: {
 
 op_hash6: {
     INSN_LIMIT_CHECK();
-    uint64_t hash = hash_6tuple(vm->packet, vm->hot.packet_len);
+    
+    // Prefetch IPv6 header for optimal SIMD processing
+    if (vm->cold.hints.use_prefetch && vm->hot.packet_len >= 54) {
+        // Prefetch the entire IPv6 header (40 bytes) + L4 header
+        VFM_PREFETCH(&vm->hot.packet[14], 0, 3);      // IPv6 header start
+        VFM_PREFETCH(&vm->hot.packet[14 + 32], 0, 3); // IPv6 addresses + L4 header
+    }
+    
+    uint64_t hash = hash_6tuple(vm->hot.packet, vm->hot.packet_len);
     STACK_PUSH(hash);
     DISPATCH();
 }
@@ -875,7 +1020,7 @@ op_ip_ver: {
     if (VFM_UNLIKELY(vm->hot.packet_len < 15)) {
         STACK_PUSH(0);  // Invalid packet
     } else {
-        uint8_t version = (vm->packet[14] >> 4) & 0x0F;
+        uint8_t version = (vm->hot.packet[14] >> 4) & 0x0F;
         STACK_PUSH((uint64_t)version);
     }
     DISPATCH();
@@ -883,12 +1028,12 @@ op_ip_ver: {
 
 op_ipv6_ext: {
     INSN_LIMIT_CHECK();
-    uint8_t field_type = vm->program[vm->hot.pc];
+    uint8_t field_type = vm->hot.program[vm->hot.pc];
     vm->hot.pc += 1;
     
     // Extract IPv6 extension header field value
     uint64_t value = vfl_extract_ipv6_ext_field((vfl_field_type_t)field_type, 
-                                                vm->packet, vm->hot.packet_len);
+                                                vm->hot.packet, vm->hot.packet_len);
     STACK_PUSH(value);
     DISPATCH();
 }
@@ -901,30 +1046,41 @@ vfm_state_t* vfm_create(void) {
     
     memset(vm, 0, sizeof(vfm_state_t));
     
-    // Allocate regular stack
-    vm->stack = aligned_alloc(16, VFM_MAX_STACK * sizeof(uint64_t));
-    if (!vm->stack) {
+    // Allocate regular stack - cache line aligned for better prefetching
+    vm->hot.stack = aligned_alloc(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(uint64_t));
+    if (!vm->hot.stack) {
         free(vm);
         return NULL;
     }
-    vm->stack_size = VFM_MAX_STACK;
+    vm->hot.stack_size = VFM_MAX_STACK;
     
-    // Allocate 128-bit stack
-    vm->stack128 = aligned_alloc(16, VFM_MAX_STACK * sizeof(vfm_u128_t));
-    if (!vm->stack128) {
-        free(vm->stack);
+    // Pre-touch stack pages to avoid page faults during execution
+    for (uint32_t i = 0; i < VFM_MAX_STACK; i += VFM_CACHE_LINE_SIZE/sizeof(uint64_t)) {
+        vm->hot.stack[i] = 0;
+    }
+    
+    // Allocate 128-bit stack - cache line aligned for better performance
+    vm->hot.stack128 = aligned_alloc(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(vfm_u128_t));
+    if (!vm->hot.stack128) {
+        free(vm->hot.stack);
         free(vm);
         return NULL;
     }
-    vm->stack128_size = VFM_MAX_STACK;
+    vm->hot.stack128_size = VFM_MAX_STACK;
+    
+    // Pre-touch 128-bit stack pages
+    for (uint32_t i = 0; i < VFM_MAX_STACK; i += VFM_CACHE_LINE_SIZE/sizeof(vfm_u128_t)) {
+        vm->hot.stack128[i].low = 0;
+        vm->hot.stack128[i].high = 0;
+    }
     
     // Set default limits
     vm->hot.insn_limit = VFM_MAX_INSN;
     
     // Enable JIT compilation by default
-    vm->jit_enabled = true;
-    vm->jit_code = NULL;
-    vm->jit_code_size = 0;
+    vm->cold.jit_enabled = true;
+    vm->cold.jit_code = NULL;
+    vm->cold.jit_code_size = 0;
     
     // Enable platform-specific optimizations
     vfm_enable_optimizations(vm);
@@ -935,22 +1091,27 @@ vfm_state_t* vfm_create(void) {
 void vfm_destroy(vfm_state_t *vm) {
     if (!vm) return;
     
-    if (vm->stack) {
-        free(vm->stack);
+    if (vm->hot.stack) {
+        free(vm->hot.stack);
     }
     
-    if (vm->stack128) {
-        free(vm->stack128);
+    if (vm->hot.stack128) {
+        free(vm->hot.stack128);
     }
     
-    // Clean up JIT code
-    if (vm->jit_code) {
-        vfm_jit_free(vm->jit_code, vm->jit_code_size);
-        vm->jit_code = NULL;
-        vm->jit_code_size = 0;
+    // Clean up JIT code and cache reference
+    if (vm->cold.jit_cache_entry) {
+        vfm_jit_cache_release(vm->cold.jit_cache_entry);
+        vm->cold.jit_cache_entry = NULL;
     }
+    if (vm->cold.jit_code && !vm->cold.jit_cache_entry) {
+        // Only free if not from cache (cache manages its own memory)
+        vfm_jit_free(vm->cold.jit_code, vm->cold.jit_code_size);
+    }
+    vm->cold.jit_code = NULL;
+    vm->cold.jit_code_size = 0;
     
-    if (vm->flow_table) {
+    if (vm->hot.flow_table) {
         vfm_flow_table_destroy(vm);
     }
     
@@ -968,15 +1129,22 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
         return result;
     }
     
-    // Clean up any existing JIT code
-    if (vm->jit_code) {
-        vfm_jit_free(vm->jit_code, vm->jit_code_size);
-        vm->jit_code = NULL;
-        vm->jit_code_size = 0;
+    // Clean up any existing JIT code and cache reference
+    if (vm->cold.jit_cache_entry) {
+        vfm_jit_cache_release(vm->cold.jit_cache_entry);
+        vm->cold.jit_cache_entry = NULL;
+    }
+    if (vm->cold.jit_code) {
+        // Only free if not from cache (cache manages its own memory)
+        if (!vm->cold.jit_cache_entry) {
+            vfm_jit_free(vm->cold.jit_code, vm->cold.jit_code_size);
+        }
+        vm->cold.jit_code = NULL;
+        vm->cold.jit_code_size = 0;
     }
     
-    vm->program = program;
-    vm->program_len = len;
+    vm->hot.program = program;
+    vm->hot.program_len = len;
     
     // Check if program contains opcodes that are not JIT compatible
     bool jit_compatible = true;
@@ -1000,22 +1168,58 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
         pc += insn_size;
     }
     
-    // Attempt JIT compilation if enabled and compatible
-    if (vm->jit_enabled && jit_compatible) {
-        #ifdef __aarch64__
-        extern bool vfm_jit_available_arm64(void);
-        if (vfm_jit_available_arm64()) {
-            vm->jit_code = vfm_jit_compile_arm64(program, len);
-            if (vm->jit_code) {
-                vm->jit_code_size = 4096; // ARM64 JIT uses fixed page size
+    // Attempt JIT compilation with cache if enabled and compatible
+    if (vm->cold.jit_enabled && jit_compatible) {
+        // Compute program hash for cache lookup
+        vfm_program_hash_t prog_hash = vfm_compute_program_hash(program, len);
+        
+        // Check cache for existing compilation
+        vfm_jit_cache_entry_t *cached = vfm_jit_cache_lookup(&prog_hash);
+        if (cached) {
+            // Cache hit - reuse existing JIT code
+            vm->cold.jit_code = cached->jit_code;
+            vm->cold.jit_code_size = cached->jit_code_size;
+            vm->cold.jit_cache_entry = cached;
+        } else {
+            // Cache miss - compile and store
+            void *jit_code = NULL;
+            size_t code_size = 0;
+            
+            #ifdef __aarch64__
+            extern bool vfm_jit_available_arm64(void);
+            if (vfm_jit_available_arm64()) {
+                uint64_t start_time = get_timestamp_ns();
+                jit_code = vfm_jit_compile_arm64(program, len);
+                if (jit_code) {
+                    code_size = 4096; // ARM64 JIT uses fixed page size
+                    uint64_t compile_time = get_timestamp_ns() - start_time;
+                    
+                    // Store in cache
+                    vm->cold.jit_cache_entry = vfm_jit_cache_store(&prog_hash, jit_code, code_size);
+                    if (vm->cold.jit_cache_entry) {
+                        vm->cold.jit_cache_entry->compile_time_ns = compile_time;
+                        vm->cold.jit_code = jit_code;
+                        vm->cold.jit_code_size = code_size;
+                    }
+                }
             }
+            #elif defined(__x86_64__)
+            uint64_t start_time = get_timestamp_ns();
+            jit_code = vfm_jit_compile_x86_64(program, len);
+            if (jit_code) {
+                code_size = len * 32; // Conservative estimate used in JIT
+                uint64_t compile_time = get_timestamp_ns() - start_time;
+                
+                // Store in cache
+                vm->cold.jit_cache_entry = vfm_jit_cache_store(&prog_hash, jit_code, code_size);
+                if (vm->cold.jit_cache_entry) {
+                    vm->cold.jit_cache_entry->compile_time_ns = compile_time;
+                    vm->cold.jit_code = jit_code;
+                    vm->cold.jit_code_size = code_size;
+                }
+            }
+            #endif
         }
-        #elif defined(__x86_64__)
-        vm->jit_code = vfm_jit_compile_x86_64(program, len);
-        if (vm->jit_code) {
-            vm->jit_code_size = len * 32; // Conservative estimate used in JIT
-        }
-        #endif
     }
     
     return VFM_SUCCESS;
@@ -1025,12 +1229,26 @@ void vfm_enable_optimizations(vfm_state_t *vm) {
     if (!vm) return;
     
     // Enable optimizations based on platform
-    #ifdef VFM_PLATFORM_MACOS
-        vm->hints.use_prefetch = true;
-        vm->hints.prefetch_distance = 1;
-        #ifdef VFM_APPLE_SILICON
-            vm->hints.use_huge_pages = true;
-        #endif
+    #ifdef VFM_APPLE_SILICON
+        // Apple Silicon specific optimizations - 128B cache lines
+        vm->cold.hints.use_prefetch = true;
+        vm->cold.hints.prefetch_distance = 2;     // Prefetch 2 instructions ahead
+        vm->cold.hints.use_huge_pages = true;     // Use huge pages for flow table
+    #elif defined(VFM_PLATFORM_MACOS)
+        // Intel Mac optimizations - 64B cache lines
+        vm->cold.hints.use_prefetch = true;
+        vm->cold.hints.prefetch_distance = 1;     // Conservative prefetch distance
+        vm->cold.hints.use_huge_pages = false;    // Less beneficial on Intel
+    #elif defined(VFM_PLATFORM_LINUX)
+        // Linux x86_64 optimizations
+        vm->cold.hints.use_prefetch = true;
+        vm->cold.hints.prefetch_distance = 1;     // Conservative for compatibility
+        vm->cold.hints.use_huge_pages = false;    // Platform dependent
+    #else
+        // Conservative defaults for other platforms
+        vm->cold.hints.use_prefetch = false;      // Disable on unknown platforms
+        vm->cold.hints.prefetch_distance = 0;
+        vm->cold.hints.use_huge_pages = false;
     #endif
 }
 
@@ -1050,36 +1268,36 @@ int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
     
     #ifdef VFM_PLATFORM_MACOS
         // Use VM_FLAGS_SUPERPAGE_SIZE_2MB for better performance
-        vm->flow_table = mmap(NULL, table_size, 
+        vm->hot.flow_table = mmap(NULL, table_size, 
                              PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     #else
-        vm->flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
+        vm->hot.flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
     #endif
     
-    if (!vm->flow_table) {
+    if (!vm->hot.flow_table) {
         return VFM_ERROR_NO_MEMORY;
     }
     
-    memset(vm->flow_table, 0, table_size);
-    vm->flow_table_mask = size - 1;
+    memset(vm->hot.flow_table, 0, table_size);
+    vm->hot.flow_table_mask = size - 1;
     
     return VFM_SUCCESS;
 }
 
 void vfm_flow_table_destroy(vfm_state_t *vm) {
-    if (!vm || !vm->flow_table) return;
+    if (!vm || !vm->hot.flow_table) return;
     
-    size_t table_size = (vm->flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
+    size_t table_size = (vm->hot.flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
     
     #ifdef VFM_PLATFORM_MACOS
-        munmap(vm->flow_table, table_size);
+        munmap(vm->hot.flow_table, table_size);
     #else
-        free(vm->flow_table);
+        free(vm->hot.flow_table);
     #endif
     
-    vm->flow_table = NULL;
-    vm->flow_table_mask = 0;
+    vm->hot.flow_table = NULL;
+    vm->hot.flow_table_mask = 0;
 }
 
 const char* vfm_error_string(vfm_error_t error) {
@@ -1120,4 +1338,15 @@ uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_
     
     vfm_jit_func_t func = (vfm_jit_func_t)jit_code;
     return func(packet, packet_len);
+}
+
+// Platform-specific timestamp function for JIT cache
+static uint64_t get_timestamp_ns(void) {
+#ifdef VFM_PLATFORM_MACOS
+    return mach_absolute_time();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
 }

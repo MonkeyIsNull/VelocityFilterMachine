@@ -35,6 +35,9 @@ else ifeq ($(UNAME_S),Linux)
     LDFLAGS += -lpthread
 endif
 
+# JIT cache requires pthread on all platforms
+LDFLAGS += -lpthread
+
 # Enable link-time optimization
 CFLAGS += -flto
 LDFLAGS += -flto
@@ -48,6 +51,7 @@ VFLISP_DIR = dsl/vflisp
 
 # Core library sources
 LIB_SRCS = $(SRC_DIR)/vfm.c \
+           $(SRC_DIR)/vfm_jit_cache.c \
            $(SRC_DIR)/verifier.c \
            $(SRC_DIR)/compiler.c
 

@@ -219,7 +219,8 @@ typedef struct vfm_state {
     void *jit_code;             // Compiled native code (NULL if not compiled)
     size_t jit_code_size;       // Size of JIT code for cleanup
     bool jit_enabled;           // Whether to attempt JIT compilation
-    uint8_t _pad_jit[7];        // Padding to 8 bytes
+    struct vfm_jit_cache_entry *jit_cache_entry;  // Reference to cached entry
+    uint8_t _pad_jit[3];        // Padding adjustment
     
     // Platform-specific optimization hints
     struct {
@@ -229,6 +230,55 @@ typedef struct vfm_state {
         uint8_t _pad[5];        // Padding to 8 bytes
     } hints;
 } vfm_state_t;
+
+// JIT Cache Configuration
+#define VFM_JIT_CACHE_MAX_ENTRIES 1024        // Maximum cached programs
+#define VFM_JIT_CACHE_MAX_MEMORY_MB 64        // Maximum memory usage
+#define VFM_JIT_CACHE_BUCKET_COUNT 256        // Hash table buckets
+#define VFM_JIT_CACHE_POOL_SIZES 4            // Number of pool sizes
+
+// JIT Cache Data Structures
+typedef struct vfm_program_hash {
+    uint32_t hash_high;     // Upper 32 bits of program hash
+    uint32_t hash_low;      // Lower 32 bits of program hash
+    uint32_t length;        // Program length for collision detection
+    uint32_t checksum;      // Simple XOR checksum for fast validation
+} vfm_program_hash_t;
+
+typedef struct vfm_jit_cache_entry {
+    vfm_program_hash_t program_hash;   // Program identifier
+    void *jit_code;                    // Compiled native code
+    size_t jit_code_size;              // Actual size of compiled code
+    uint32_t ref_count;                // Reference counting for cleanup
+    uint32_t _pad1;                    // Padding
+    uint64_t last_used;                // Timestamp for LRU eviction
+    uint64_t hit_count;                // Usage statistics
+    uint64_t compile_time_ns;          // Compilation time tracking
+    struct vfm_jit_cache_entry *next;  // Hash table collision chain
+} VFM_CACHE_ALIGNED vfm_jit_cache_entry_t;
+
+typedef struct vfm_jit_cache_stats {
+    uint64_t cache_hits;               // Successful cache lookups
+    uint64_t cache_misses;             // Failed cache lookups
+    uint64_t total_compilations;       // Total JIT compilations performed
+    uint64_t memory_used;              // Current memory usage
+    uint64_t memory_peak;              // Peak memory usage
+    uint64_t evictions;                // Cache evictions performed
+    double avg_compile_time_ms;        // Average compilation time
+    double cache_hit_ratio;            // Hit ratio percentage
+    uint32_t active_entries;           // Current cache entries
+    uint32_t _pad;                     // Padding
+} vfm_jit_cache_stats_t;
+
+typedef struct vfm_jit_cache_config {
+    uint32_t max_entries;              // Maximum cache entries
+    size_t max_memory_mb;              // Memory limit in MB
+    uint32_t bucket_count;             // Hash table size
+    bool enable_stats;                 // Enable statistics collection
+    bool enable_prefetch;              // Enable prefetching
+    uint32_t eviction_batch_size;      // LRU eviction batch size
+    uint8_t _pad[3];                   // Padding
+} vfm_jit_cache_config_t;
 
 // BPF compilation targets
 typedef struct bpf_insn {
@@ -337,6 +387,30 @@ uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
 bool vfm_jit_available_arm64(void);
 
+// JIT Cache Management
+int vfm_jit_cache_init(const vfm_jit_cache_config_t *config);
+void vfm_jit_cache_destroy(void);
+int vfm_jit_cache_configure(const vfm_jit_cache_config_t *config);
+
+// Program Hash Functions
+vfm_program_hash_t vfm_compute_program_hash(const uint8_t *program, uint32_t len);
+bool vfm_program_hash_equal(const vfm_program_hash_t *a, const vfm_program_hash_t *b);
+
+// Cache Operations
+vfm_jit_cache_entry_t* vfm_jit_cache_lookup(const vfm_program_hash_t *hash);
+vfm_jit_cache_entry_t* vfm_jit_cache_store(const vfm_program_hash_t *hash, 
+                                           void *jit_code, size_t code_size);
+void vfm_jit_cache_release(vfm_jit_cache_entry_t *entry);
+
+// Cache Statistics and Monitoring
+void vfm_jit_cache_get_stats(vfm_jit_cache_stats_t *stats);
+void vfm_jit_cache_reset_stats(void);
+void vfm_jit_cache_print_stats(void);
+
+// JIT Cache Internal Functions (implementation only)
+void vfm_jit_cache_evict_lru(size_t bytes_needed);
+void vfm_jit_cache_update_lru(vfm_jit_cache_entry_t *entry);
+
 // Platform-specific optimizations
 void vfm_enable_optimizations(vfm_state_t *vm);
 
@@ -347,6 +421,10 @@ void vfm_reset_stats(vfm_state_t *vm);
 // Flow table operations
 int vfm_flow_table_init(vfm_state_t *vm, uint32_t size);
 void vfm_flow_table_destroy(vfm_state_t *vm);
+
+// Hash functions for testing (cross-platform optimized)
+uint64_t vfm_hash_ipv4_5tuple(const uint8_t *packet, uint16_t len);
+uint64_t vfm_hash_ipv6_5tuple(const uint8_t *packet, uint16_t len);
 void vfm_flow_table_clear(vfm_state_t *vm);
 
 // Utility functions

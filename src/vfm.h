@@ -309,63 +309,91 @@ typedef struct vfm_u128 {
     uint64_t high;  // Upper 64 bits
 } vfm_u128_t;
 
-// VM state structure - optimized for cache locality
+// JIT Cache Data Structures
+typedef struct vfm_program_hash {
+    uint32_t hash_high;     // Upper 32 bits of program hash
+    uint32_t hash_low;      // Lower 32 bits of program hash
+    uint32_t length;        // Program length for collision detection
+    uint32_t checksum;      // Simple XOR checksum for fast validation
+} vfm_program_hash_t;
+
+typedef struct vfm_jit_cache_entry {
+    vfm_program_hash_t program_hash;   // Program identifier
+    void *jit_code;                    // Compiled native code
+    size_t jit_code_size;              // Actual size of compiled code
+    uint32_t ref_count;                // Reference counting for cleanup
+    uint32_t _pad1;                    // Padding
+    uint64_t last_used;                // Timestamp for LRU eviction
+    uint64_t hit_count;                // Usage statistics
+    uint64_t compile_time_ns;          // Compilation time tracking
+    struct vfm_jit_cache_entry *next;  // Hash table collision chain
+} VFM_CACHE_ALIGNED vfm_jit_cache_entry_t;
+
+// VM state structure - optimized for cache locality and platform-specific cache lines
 typedef struct vfm_state {
-    // Hot data - frequently accessed during execution
+    // Hot execution context - First cache line (optimized for Apple Silicon 128B cache lines)
     struct {
-        // Program counter and execution state
-        uint32_t pc;
-        uint32_t insn_count;
-        uint32_t insn_limit;
-        vfm_error_t error;
+        // Instruction execution hot path (16 bytes)
+        uint32_t pc;                    // Program counter
+        uint32_t insn_count;           // Instruction count  
+        uint32_t insn_limit;           // Instruction limit
+        vfm_error_t error;             // Error state
         
-        // Stack pointer
-        uint32_t sp;
+        // Stack management (16 bytes)
+        uint32_t sp;                   // 64-bit stack pointer
+        uint32_t sp128;                // 128-bit stack pointer
+        uint32_t stack_size;           // Stack size
+        uint32_t stack128_size;        // 128-bit stack size
         
-        // Packet bounds (hot for bounds checking)
-        uint16_t packet_len;
-        uint16_t _pad1;  // Padding for alignment
-    } VFM_CACHE_ALIGNED hot;
+        // Packet bounds checking (8 bytes)
+        uint16_t packet_len;           // Packet length
+        uint16_t _pad1;                // Padding
+        uint32_t _pad2;                // Padding
+        
+        // Frequently accessed pointers (24 bytes)
+        const uint8_t *packet;         // Packet data pointer
+        uint64_t *stack;               // Stack pointer
+        const uint8_t *program;        // Program pointer
+        
+        // Program execution state (8 bytes)  
+        uint32_t program_len;          // Program length
+        uint32_t _pad3;                // Padding
+        
+        // 128-bit stack pointer and flow state (24 bytes)
+        vfm_u128_t *stack128;          // 128-bit stack pointer
+        vfm_flow_entry_t *flow_table;  // Flow table pointer
+        uint32_t flow_table_mask;      // Flow table mask
+        uint32_t _pad4;                // Padding
+        
+        // Remaining padding to optimize for 128B cache line (24 bytes remaining)
+        uint64_t _pad5[3];             // Padding for cache line optimization
+        
+    } VFM_CACHE_ALIGNED hot;           // Total: 128 bytes (perfect fit for Apple Silicon)
     
-    // Packet data pointer (read-only)
-    const uint8_t *packet;
-    
-    // Stack - aligned for performance
-    uint64_t *stack VFM_ALIGNED(16);
-    uint32_t stack_size;
-    uint32_t _pad2;  // Padding
-    
-    // 128-bit stack for IPv6 operations - aligned for performance
-    vfm_u128_t *stack128 VFM_ALIGNED(16);
-    uint32_t stack128_size;
-    uint32_t sp128;  // 128-bit stack pointer
-    
-    // Program
-    const uint8_t *program;
-    uint32_t program_len;
-    uint32_t _pad3;  // Padding
-    
-    // Registers (faster than pure stack) - cache line aligned
-    uint64_t regs[16] VFM_CACHE_ALIGNED;
-    
-    // Flow state table (optional) - for stateful filtering
-    vfm_flow_entry_t *flow_table;
-    uint32_t flow_table_mask;  // Size - 1 for fast modulo
-    uint32_t _pad4;  // Padding
-    
-    // JIT compilation cache
-    void *jit_code;             // Compiled native code (NULL if not compiled)
-    size_t jit_code_size;       // Size of JIT code for cleanup
-    bool jit_enabled;           // Whether to attempt JIT compilation
-    uint8_t _pad_jit[7];        // Padding to 8 bytes
-    
-    // Platform-specific optimization hints
+    // Cold data - separate cache line(s)
     struct {
-        bool use_prefetch;      // Enable prefetching
-        bool use_huge_pages;    // Use huge pages for flow table
-        uint8_t prefetch_distance;  // How far ahead to prefetch
-        uint8_t _pad[5];        // Padding to 8 bytes
-    } hints;
+        // Registers for complex operations - cache line aligned for burst access
+        uint64_t regs[16] VFM_CACHE_ALIGNED;
+        
+        // JIT compilation data
+        void *jit_code;                // Compiled native code
+        size_t jit_code_size;          // Size of JIT code
+        bool jit_enabled;              // JIT compilation enabled
+        struct vfm_jit_cache_entry *jit_cache_entry;  // Cache entry reference
+        uint32_t _pad_jit;             // Padding
+        
+        // Platform-specific optimization hints
+        struct {
+            bool use_prefetch;         // Enable prefetching
+            bool use_huge_pages;       // Use huge pages for flow table
+            uint8_t prefetch_distance; // How far ahead to prefetch
+            uint8_t _pad[5];           // Padding
+        } hints;
+        
+        // Additional padding for future expansion
+        uint64_t _pad_cold[8];         // Reserved for future use
+        
+    } VFM_CACHE_ALIGNED cold;
 } vfm_state_t;
 
 // Public API
@@ -424,6 +452,14 @@ uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_
 // JIT compilation for ARM64
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
 bool vfm_jit_available_arm64(void);
+
+// JIT Cache Functions
+vfm_program_hash_t vfm_compute_program_hash(const uint8_t *program, uint32_t len);
+bool vfm_program_hash_equal(const vfm_program_hash_t *a, const vfm_program_hash_t *b);
+vfm_jit_cache_entry_t* vfm_jit_cache_lookup(const vfm_program_hash_t *hash);
+vfm_jit_cache_entry_t* vfm_jit_cache_store(const vfm_program_hash_t *hash, 
+                                           void *jit_code, size_t code_size);
+void vfm_jit_cache_release(vfm_jit_cache_entry_t *entry);
 
 // Platform-specific optimizations
 void vfm_enable_optimizations(vfm_state_t *vm);
