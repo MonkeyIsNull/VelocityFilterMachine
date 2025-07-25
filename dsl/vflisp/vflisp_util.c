@@ -1,12 +1,26 @@
 #include "vflisp_types.h"
-#include "../../../PacketVelocity/include/pcv_flow.h"
 #include <string.h>
 #include <arpa/inet.h>
 
+// IPv6 extension header parsing information (standalone definition)
+typedef struct vfl_ipv6_ext_headers {
+    uint8_t has_ext_headers;     /* 1 if extension headers are present */
+    uint8_t ext_header_count;    /* Number of extension headers */
+    uint16_t total_ext_length;   /* Total length of all extension headers */
+    uint8_t final_protocol;      /* Final protocol after all extension headers */
+    
+    /* Fragment header information (if present) */
+    uint32_t fragment_id;        /* Fragment identification */
+    uint16_t fragment_offset;    /* Fragment offset (in 8-byte units) */
+    uint8_t fragment_flags;      /* Fragment flags (more fragments bit) */
+    
+    uint8_t reserved;            /* Padding for alignment */
+} vfl_ipv6_ext_headers;
+
 // Helper function to parse IPv6 extension headers for field extraction
-static int parse_ipv6_ext_for_field(const uint8_t *packet, uint16_t len, pcv_ipv6_ext_headers *ext_info) {
+static int parse_ipv6_ext_for_field(const uint8_t *packet, uint16_t len, vfl_ipv6_ext_headers *ext_info) {
     // Simple IPv6 extension header parsing for field extraction
-    memset(ext_info, 0, sizeof(pcv_ipv6_ext_headers));
+    memset(ext_info, 0, sizeof(vfl_ipv6_ext_headers));
     
     if (len < 54) return -1;  // Not enough data for IPv6
     
@@ -116,7 +130,7 @@ uint16_t vfl_get_field_offset(vfl_field_type_t field_type, const uint8_t *packet
                 return (field_type == VFL_FIELD_SRC_PORT) ? 34 : 36;
             } else if (version == 6) {
                 // IPv6 requires extension header parsing
-                pcv_ipv6_ext_headers ext_info;
+                vfl_ipv6_ext_headers ext_info;
                 if (parse_ipv6_ext_for_field(packet, len, &ext_info) != 0) {
                     return 0;  // Parse failed
                 }
@@ -170,7 +184,7 @@ bool vfl_field_supports_ip_version(vfl_field_type_t field_type, uint8_t ip_versi
 
 // Extract IPv6 extension header field values
 uint64_t vfl_extract_ipv6_ext_field(vfl_field_type_t field_type, const uint8_t *packet, uint16_t len) {
-    pcv_ipv6_ext_headers ext_info;
+    vfl_ipv6_ext_headers ext_info;
     
     if (parse_ipv6_ext_for_field(packet, len, &ext_info) != 0) {
         return 0;  // Parse failed
