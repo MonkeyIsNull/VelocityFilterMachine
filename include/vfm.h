@@ -174,11 +174,24 @@ typedef enum {
     VFM_FMT_OFFSET16   // 16-bit offset (for jumps and packet access)
 } vfm_format_t;
 
-// Flow table entry
+// Phase 2.3: Flow table statistics for performance monitoring
+typedef struct vfm_flow_stats {
+    uint64_t lookups;       // Total number of lookups
+    uint64_t hits;          // Successful lookups
+    uint64_t misses;        // Failed lookups
+    uint64_t collisions;    // Hash collisions
+    uint64_t evictions;     // LRU evictions
+    uint32_t load_factor;   // Current load percentage (0-100)
+    double hit_rate;        // Cache hit rate (0.0-1.0)
+} vfm_flow_stats_t;
+
+// Flow table entry - Phase 2.3 cache-optimized layout
 typedef struct vfm_flow_entry {
-    uint64_t key;
-    uint64_t value;
-    uint64_t last_seen;
+    uint64_t key;           // Hash key (most frequently accessed)
+    uint64_t value;         // Associated value
+    uint64_t last_seen;     // Timestamp for LRU eviction
+    uint32_t collision_count; // Number of collisions for this slot
+    uint32_t _pad;          // Padding to 32-byte alignment
 } VFM_CACHE_ALIGNED vfm_flow_entry_t;
 
 // VM state structure - optimized for cache locality
@@ -197,6 +210,21 @@ typedef struct vfm_state {
         // Packet bounds (hot for bounds checking)
         uint16_t packet_len;
         uint16_t _pad1;  // Padding for alignment
+        
+        // Flow state table (moved to hot for Phase 2.3 cache optimization)
+        vfm_flow_entry_t *flow_table;
+        uint32_t flow_table_mask;  // Size - 1 for fast modulo
+        
+        // Phase 2.3: Flow table performance tracking
+        struct {
+            uint64_t lookups;       // Total number of lookups
+            uint64_t hits;          // Successful lookups
+            uint64_t misses;        // Failed lookups
+            uint64_t collisions;    // Hash collisions
+            uint64_t evictions;     // LRU evictions
+            uint32_t load_factor;   // Current load percentage (0-100)
+            uint32_t _pad;          // Padding
+        } flow_stats;
     } VFM_CACHE_ALIGNED hot;
     
     // Packet data pointer (read-only)
@@ -214,11 +242,6 @@ typedef struct vfm_state {
     
     // Registers (faster than pure stack) - cache line aligned
     uint64_t regs[16] VFM_CACHE_ALIGNED;
-    
-    // Flow state table (optional) - for stateful filtering
-    vfm_flow_entry_t *flow_table;
-    uint32_t flow_table_mask;  // Size - 1 for fast modulo
-    uint32_t _pad4;  // Padding
     
     // JIT compilation cache
     void *jit_code;             // Compiled native code (NULL if not compiled)
@@ -426,6 +449,7 @@ void vfm_reset_stats(vfm_state_t *vm);
 // Flow table operations
 int vfm_flow_table_init(vfm_state_t *vm, uint32_t size);
 void vfm_flow_table_destroy(vfm_state_t *vm);
+void vfm_flow_table_get_stats(const vfm_state_t *vm, vfm_flow_stats_t *stats);
 
 // Hash functions for testing (cross-platform optimized)
 uint64_t vfm_hash_ipv4_5tuple(const uint8_t *packet, uint16_t len);

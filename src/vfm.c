@@ -188,17 +188,45 @@ uint64_t vfm_hash_ipv6_5tuple(const uint8_t *packet, uint16_t len) {
     return hash_6tuple(packet, len);
 }
 
-// Flow table operations
+// Phase 2.3: Enhanced flow table operations with collision handling and prefetching
 static VFM_ALWAYS_INLINE uint64_t flow_table_get(vfm_state_t *vm, uint64_t key) {
     if (VFM_UNLIKELY(!vm->hot.flow_table)) return 0;
+    
+    vm->hot.flow_stats.lookups++;
     
     uint32_t index = key & vm->hot.flow_table_mask;
     vfm_flow_entry_t *entry = &vm->hot.flow_table[index];
     
-    if (VFM_LIKELY(entry->key == key)) {
+    // Prefetch next cache line for better locality
+    if (vm->hints.use_prefetch) {
+        uint32_t prefetch_index = (index + vm->hints.prefetch_distance) & vm->hot.flow_table_mask;
+        __builtin_prefetch(&vm->hot.flow_table[prefetch_index], 0, 3);
+    }
+    
+    // Primary lookup
+    if (VFM_LIKELY(entry->key == key && entry->key != 0)) {
+        entry->last_seen = vfm_get_time();
+        vm->hot.flow_stats.hits++;
         return entry->value;
     }
     
+    // Linear probing for collision resolution (max 4 probes for cache efficiency)
+    for (int probe = 1; probe <= 4; probe++) {
+        uint32_t probe_index = (index + probe) & vm->hot.flow_table_mask;
+        vfm_flow_entry_t *probe_entry = &vm->hot.flow_table[probe_index];
+        
+        if (probe_entry->key == key && probe_entry->key != 0) {
+            probe_entry->last_seen = vfm_get_time();
+            vm->hot.flow_stats.hits++;
+            vm->hot.flow_stats.collisions++;
+            return probe_entry->value;
+        }
+        
+        // Stop probing if we hit an empty slot
+        if (probe_entry->key == 0) break;
+    }
+    
+    vm->hot.flow_stats.misses++;
     return 0;
 }
 
@@ -207,10 +235,52 @@ static VFM_ALWAYS_INLINE void flow_table_set(vfm_state_t *vm, uint64_t key, uint
     
     uint32_t index = key & vm->hot.flow_table_mask;
     vfm_flow_entry_t *entry = &vm->hot.flow_table[index];
+    uint64_t current_time = vfm_get_time();
     
-    entry->key = key;
-    entry->value = value;
-    entry->last_seen = vfm_get_time();
+    // Check if updating existing entry
+    if (entry->key == key && entry->key != 0) {
+        entry->value = value;
+        entry->last_seen = current_time;
+        return;
+    }
+    
+    // Find insertion point using linear probing with LRU eviction
+    vfm_flow_entry_t *best_entry = entry;
+    uint64_t oldest_time = entry->last_seen;
+    uint32_t best_index = index;
+    
+    for (int probe = 0; probe <= 4; probe++) {
+        uint32_t probe_index = (index + probe) & vm->hot.flow_table_mask;
+        vfm_flow_entry_t *probe_entry = &vm->hot.flow_table[probe_index];
+        
+        // Found empty slot - use it immediately
+        if (probe_entry->key == 0) {
+            best_entry = probe_entry;
+            best_index = probe_index;
+            break;
+        }
+        
+        // Track oldest entry for potential LRU eviction
+        if (probe_entry->last_seen < oldest_time) {
+            oldest_time = probe_entry->last_seen;
+            best_entry = probe_entry;
+            best_index = probe_index;
+        }
+    }
+    
+    // Update statistics
+    if (best_entry->key != 0) {
+        vm->hot.flow_stats.evictions++;
+    }
+    if (best_index != index) {
+        vm->hot.flow_stats.collisions++;
+        best_entry->collision_count++;
+    }
+    
+    // Insert new entry
+    best_entry->key = key;
+    best_entry->value = value;
+    best_entry->last_seen = current_time;
 }
 
 // Bounds checking macro - inlined for performance
@@ -1255,6 +1325,18 @@ void vfm_enable_optimizations(vfm_state_t *vm) {
 int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
     if (!vm || size == 0) return VFM_ERROR_INVALID_PROGRAM;
     
+    // Phase 2.3: Platform-aware hash table sizing
+    // Adjust size based on cache line optimization
+    #ifdef VFM_APPLE_SILICON
+        // Apple Silicon: optimize for 128-byte cache lines
+        uint32_t entries_per_cache_line = 128 / sizeof(vfm_flow_entry_t);  // 4 entries per line
+        size = ((size + entries_per_cache_line - 1) / entries_per_cache_line) * entries_per_cache_line;
+    #else
+        // x86_64: optimize for 64-byte cache lines
+        uint32_t entries_per_cache_line = 64 / sizeof(vfm_flow_entry_t);   // 2 entries per line
+        size = ((size + entries_per_cache_line - 1) / entries_per_cache_line) * entries_per_cache_line;
+    #endif
+    
     // Round up to power of 2
     size--;
     size |= size >> 1;
@@ -1267,10 +1349,9 @@ int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
     size_t table_size = size * sizeof(vfm_flow_entry_t);
     
     #ifdef VFM_PLATFORM_MACOS
-        // Use VM_FLAGS_SUPERPAGE_SIZE_2MB for better performance
-        vm->hot.flow_table = mmap(NULL, table_size, 
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        // Use standard mmap on macOS (huge pages handled by VM system)
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        vm->hot.flow_table = mmap(NULL, table_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     #else
         vm->hot.flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
     #endif
@@ -1279,8 +1360,12 @@ int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
         return VFM_ERROR_NO_MEMORY;
     }
     
+    // Initialize flow table and statistics
     memset(vm->hot.flow_table, 0, table_size);
     vm->hot.flow_table_mask = size - 1;
+    
+    // Initialize statistics
+    memset(&vm->hot.flow_stats, 0, sizeof(vm->hot.flow_stats));
     
     return VFM_SUCCESS;
 }
@@ -1298,6 +1383,43 @@ void vfm_flow_table_destroy(vfm_state_t *vm) {
     
     vm->hot.flow_table = NULL;
     vm->hot.flow_table_mask = 0;
+    
+    // Clear statistics
+    memset(&vm->hot.flow_stats, 0, sizeof(vm->hot.flow_stats));
+}
+
+// Phase 2.3: Get flow table performance statistics
+void vfm_flow_table_get_stats(const vfm_state_t *vm, vfm_flow_stats_t *stats) {
+    if (!vm || !stats) return;
+    
+    // Copy basic statistics
+    stats->lookups = vm->hot.flow_stats.lookups;
+    stats->hits = vm->hot.flow_stats.hits;
+    stats->misses = vm->hot.flow_stats.misses;
+    stats->collisions = vm->hot.flow_stats.collisions;
+    stats->evictions = vm->hot.flow_stats.evictions;
+    
+    // Calculate derived statistics
+    if (stats->lookups > 0) {
+        stats->hit_rate = (double)stats->hits / (double)stats->lookups;
+    } else {
+        stats->hit_rate = 0.0;
+    }
+    
+    // Calculate load factor by counting non-zero entries
+    uint32_t used_entries = 0;
+    uint32_t total_entries = vm->hot.flow_table_mask + 1;
+    
+    if (vm->hot.flow_table && total_entries > 0) {
+        for (uint32_t i = 0; i < total_entries; i++) {
+            if (vm->hot.flow_table[i].key != 0) {
+                used_entries++;
+            }
+        }
+        stats->load_factor = (used_entries * 100) / total_entries;
+    } else {
+        stats->load_factor = 0;
+    }
 }
 
 const char* vfm_error_string(vfm_error_t error) {
