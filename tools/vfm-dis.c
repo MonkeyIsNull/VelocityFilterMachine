@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  /* For getopt_long on some systems */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

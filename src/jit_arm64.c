@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <libkern/OSCacheControl.h>
 #ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #endif
 
@@ -426,8 +426,23 @@ static bool flush_and_protect_memory(uint8_t *code, size_t code_pos, size_t code
         return false;
     }
 #else
-    // On other ARM64 systems, just flush the instruction cache
-    __builtin___clear_cache((char*)code, (char*)code + code_pos);
+    // On other ARM64 systems, flush the instruction cache and set executable permissions
+    #if defined(__GNUC__) || defined(__clang__)
+        __builtin___clear_cache((char*)code, (char*)code + code_pos);
+    #else
+        // Fallback for other compilers - attempt manual cache flush via syscall
+        #ifdef __linux__
+            // Linux-specific cache flush
+            asm volatile("dsb sy\n\t"
+                        "isb"
+                        ::: "memory");
+        #endif
+    #endif
+    
+    // Set memory permissions to read+execute
+    if (mprotect(code, code_size, PROT_READ | PROT_EXEC) != 0) {
+        return false;
+    }
 #endif
     return true;
 }

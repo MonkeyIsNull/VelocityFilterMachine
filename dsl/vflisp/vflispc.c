@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  /* For getopt_long on some systems */
 #include "vflisp_types.h"
 #include "../../include/vfm.h"
 #include <stdio.h>

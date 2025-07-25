@@ -25,6 +25,12 @@
     #ifndef _POSIX_C_SOURCE
         #define _POSIX_C_SOURCE 200809L  /* For clock_gettime, strdup, and other POSIX functions */
     #endif
+    #ifndef _DEFAULT_SOURCE
+        #define _DEFAULT_SOURCE  /* For sysconf and other system functions */
+    #endif
+    #ifndef _ISOC11_SOURCE
+        #define _ISOC11_SOURCE  /* For aligned_alloc and other C11 functions */
+    #endif
     #include <sched.h>
     #include <unistd.h>
     #include <pthread.h>
@@ -53,6 +59,28 @@ extern "C" {
     #define VFM_CACHE_LINE_SIZE 128  // Apple Silicon has 128-byte cache lines
 #else
     #define VFM_CACHE_LINE_SIZE 64   // Most x86_64 CPUs
+#endif
+
+// Aligned allocation compatibility wrapper
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+    // C11 aligned_alloc is available
+    #include <stdlib.h>
+    #define VFM_ALIGNED_ALLOC(alignment, size) aligned_alloc(alignment, size)
+#elif defined(VFM_PLATFORM_LINUX) || defined(_POSIX_C_SOURCE)
+    // Use POSIX posix_memalign as fallback
+    #include <stdlib.h>
+    static inline void* vfm_aligned_alloc(size_t alignment, size_t size) {
+        void *ptr = NULL;
+        if (posix_memalign(&ptr, alignment, size) == 0) {
+            return ptr;
+        }
+        return NULL;
+    }
+    #define VFM_ALIGNED_ALLOC(alignment, size) vfm_aligned_alloc(alignment, size)
+#else
+    // Fallback to regular malloc (may not be aligned)
+    #include <stdlib.h>
+    #define VFM_ALIGNED_ALLOC(alignment, size) malloc(size)
 #endif
 
 // Alignment and optimization macros
@@ -1163,7 +1191,7 @@ vfm_state_t* vfm_create(void) {
     
     // Allocate stack with proper alignment
     vm->stack_size = VFM_MAX_STACK;
-    vm->stack = aligned_alloc(16, vm->stack_size * sizeof(uint64_t));
+    vm->stack = VFM_ALIGNED_ALLOC(16, vm->stack_size * sizeof(uint64_t));
     if (!vm->stack) {
         free(vm);
         return NULL;

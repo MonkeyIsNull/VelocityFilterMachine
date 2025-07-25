@@ -278,7 +278,7 @@ vfm_jit_cache_entry_t* vfm_jit_cache_store(const vfm_program_hash_t *hash,
     }
     
     // Allocate new cache entry
-    vfm_jit_cache_entry_t *entry = aligned_alloc(VFM_CACHE_LINE_SIZE, sizeof(vfm_jit_cache_entry_t));
+    vfm_jit_cache_entry_t *entry = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, sizeof(vfm_jit_cache_entry_t));
     if (!entry) {
         pthread_mutex_unlock(&g_jit_cache.cache_mutex);
         return NULL;

@@ -1126,13 +1126,13 @@ op_ipv6_ext: {
 
 // VM management functions
 vfm_state_t* vfm_create(void) {
-    vfm_state_t *vm = aligned_alloc(VFM_CACHE_LINE_SIZE, sizeof(vfm_state_t));
+    vfm_state_t *vm = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, sizeof(vfm_state_t));
     if (!vm) return NULL;
     
     memset(vm, 0, sizeof(vfm_state_t));
     
     // Allocate regular stack - cache line aligned for better prefetching
-    vm->hot.stack = aligned_alloc(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(uint64_t));
+    vm->hot.stack = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(uint64_t));
     if (!vm->hot.stack) {
         free(vm);
         return NULL;
@@ -1145,7 +1145,7 @@ vfm_state_t* vfm_create(void) {
     }
     
     // Allocate 128-bit stack - cache line aligned for better performance
-    vm->hot.stack128 = aligned_alloc(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(vfm_u128_t));
+    vm->hot.stack128 = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, VFM_MAX_STACK * sizeof(vfm_u128_t));
     if (!vm->hot.stack128) {
         free(vm->hot.stack);
         free(vm);
@@ -1368,7 +1368,7 @@ int vfm_flow_table_init(vfm_state_t *vm, uint32_t size) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS;
         vm->hot.flow_table = mmap(NULL, table_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     #else
-        vm->hot.flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
+        vm->hot.flow_table = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, table_size);
     #endif
     
     if (!vm->hot.flow_table) {
@@ -1747,7 +1747,7 @@ vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
     
     // Initialize each core context with isolation
     for (uint32_t i = 0; i < num_cores; i++) {
-        mc_vm->cores[i] = aligned_alloc(VFM_CACHE_LINE_SIZE, sizeof(vfm_core_context_t));
+        mc_vm->cores[i] = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, sizeof(vfm_core_context_t));
         if (!mc_vm->cores[i]) {
             // Cleanup on failure
             for (uint32_t j = 0; j < i; j++) {
@@ -1764,7 +1764,7 @@ vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
         
         // Initialize per-core stack (isolated to prevent false sharing)
         mc_vm->cores[i]->stack_size = VFM_STACK_SIZE;
-        mc_vm->cores[i]->stack = aligned_alloc(128, VFM_STACK_SIZE * sizeof(uint64_t));
+        mc_vm->cores[i]->stack = VFM_ALIGNED_ALLOC(128, VFM_STACK_SIZE * sizeof(uint64_t));
         if (!mc_vm->cores[i]->stack) {
             // Cleanup on failure
             for (uint32_t j = 0; j <= i; j++) {
@@ -1814,7 +1814,7 @@ vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
             mc_vm->flow_table = NULL;
         }
     #else
-        mc_vm->flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
+        mc_vm->flow_table = VFM_ALIGNED_ALLOC(VFM_CACHE_LINE_SIZE, table_size);
     #endif
     
     if (mc_vm->flow_table) {
