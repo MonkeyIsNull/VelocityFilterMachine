@@ -186,6 +186,80 @@ typedef struct vfm_flow_stats {
     double hit_rate;        // Cache hit rate (0.0-1.0)
 } vfm_flow_stats_t;
 
+// Phase 3.2: Adaptive JIT optimization structures
+typedef struct vfm_instruction_profile {
+    uint64_t execution_count;      // How many times this instruction was executed
+    uint64_t cycle_count;          // Estimated CPU cycles consumed
+    uint32_t branch_taken_count;   // For conditional instructions
+    uint32_t branch_not_taken_count;
+    uint32_t cache_misses;         // Memory access pattern data
+    uint32_t _pad;                 // Padding
+} vfm_instruction_profile_t;
+
+typedef struct vfm_execution_profile {
+    // Per-instruction profiling data
+    vfm_instruction_profile_t *instruction_profiles;
+    uint32_t instruction_count;
+    
+    // Hot path detection
+    uint32_t *hot_paths;           // Most frequently executed instruction sequences
+    uint32_t hot_path_count;
+    
+    // Packet pattern analysis - Phase 3.2.2 enhanced patterns
+    struct {
+        uint64_t ipv4_packets;     // IPv4 vs IPv6 packet distribution
+        uint64_t ipv6_packets;
+        uint64_t tcp_packets;      // Protocol distribution
+        uint64_t udp_packets;
+        uint64_t icmp_packets;     // ICMP packets
+        uint64_t icmpv6_packets;   // ICMPv6 packets
+        uint64_t dns_packets;      // DNS packets (UDP port 53/5353)
+        uint64_t other_packets;
+        
+        // TCP-specific patterns
+        uint64_t tcp_syn_packets;  // TCP SYN packets
+        uint64_t tcp_ack_packets;  // TCP ACK packets
+        
+        // Packet size distribution
+        uint64_t small_packets;    // <= 64 bytes
+        uint64_t medium_packets;   // 65-512 bytes
+        uint64_t large_packets;    // 513-1500 bytes
+        uint64_t jumbo_packets;    // > 1500 bytes
+        
+        // Network patterns
+        uint32_t common_src_subnet; // Most common source subnet (/24)
+        uint32_t src_subnet_count;   // Count for common subnet
+        uint64_t burst_packets;      // Packets in bursts (< 1ms apart)
+        
+        uint64_t average_packet_size;
+        uint64_t total_packets;
+    } packet_patterns;
+    
+    // Branch prediction hints
+    struct {
+        uint32_t *likely_taken;    // Instructions where branches are usually taken
+        uint32_t *likely_not_taken;
+        uint32_t hint_count;
+    } branch_hints;
+    
+    // Memory access patterns
+    struct {
+        uint64_t stack_accesses;   // Stack vs heap access patterns
+        uint64_t heap_accesses;
+        uint64_t flow_table_hits;
+        uint64_t flow_table_misses;
+    } memory_patterns;
+    
+} vfm_execution_profile_t;
+
+// JIT optimization levels
+typedef enum {
+    VFM_JIT_OPT_NONE = 0,         // No optimization
+    VFM_JIT_OPT_BASIC = 1,        // Basic optimizations
+    VFM_JIT_OPT_ADAPTIVE = 2,     // Profile-guided optimization
+    VFM_JIT_OPT_AGGRESSIVE = 3    // Maximum optimization
+} vfm_jit_optimization_level_t;
+
 // Phase 3.1: Multi-core VFM architecture
 typedef struct vfm_core_context {
     // Core-local execution state - must be isolated per thread
@@ -233,12 +307,25 @@ typedef struct vfm_shared_context {
         bool use_prefetch;
         bool use_huge_pages;
         uint8_t prefetch_distance;
-        uint8_t _pad[5];
+        
+        // Phase 3.2.2: Packet pattern optimization flags
+        bool optimize_for_ipv4;        // Optimize for IPv4-heavy workloads
+        bool optimize_for_ipv6;        // Optimize for IPv6-heavy workloads
+        bool optimize_for_tcp;         // Optimize for TCP-heavy workloads
+        bool optimize_for_small_packets; // Optimize for small packet workloads
+        bool optimize_for_bursts;      // Optimize for burst traffic patterns
+        uint8_t _pad[0];               // No padding needed now
     } hints;
     
     // Multi-core configuration
     uint32_t num_cores;             // Number of cores to use
     uint32_t numa_node;             // NUMA node for memory allocation
+    
+    // Phase 3.2: Adaptive JIT optimization
+    vfm_execution_profile_t *execution_profile;  // Runtime profiling data
+    vfm_jit_optimization_level_t opt_level;      // Current optimization level
+    uint32_t recompilation_threshold;            // When to trigger recompilation
+    uint64_t total_executions;                   // Total filter executions
     
 } VFM_CACHE_ALIGNED vfm_shared_context_t;
 
@@ -511,6 +598,12 @@ uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_
 // JIT compilation for ARM64
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
 bool vfm_jit_available_arm64(void);
+
+// Phase 3.2.3: Adaptive JIT compilation with profile-guided optimization
+void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len, 
+                                     vfm_execution_profile_t *profile);
+void* vfm_jit_compile_x86_64_adaptive(const uint8_t *program, uint32_t len, 
+                                      vfm_execution_profile_t *profile);
 
 // JIT Cache Management
 int vfm_jit_cache_init(const vfm_jit_cache_config_t *config);

@@ -1046,3 +1046,170 @@ done:
     
     return code;
 }
+
+// Phase 3.2.3: Adaptive x86_64 JIT compilation with packet pattern optimization
+void* vfm_jit_compile_x86_64_adaptive(const uint8_t *program, uint32_t len, 
+                                      vfm_execution_profile_t *profile) {
+    if (!profile) {
+        // Fall back to regular compilation if no profile available
+        return vfm_jit_compile_x86_64(program, len);
+    }
+    
+    // Check CPU capabilities for adaptive instruction selection
+    x86_64_caps_t caps = detect_cpu_capabilities();
+    
+    size_t code_size = len * 32; // Conservative estimate
+    void *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        return NULL;
+    }
+    
+    x86_64_jit_t jit = {
+        .code = (uint8_t*)code,
+        .pos = 0,
+        .size = code_size,
+        .caps = caps
+    };
+    
+    emit_prologue(&jit);
+    
+    // Phase 3.2.3: Adaptive instruction selection based on packet patterns
+    bool use_avx2_ipv4 = false;
+    bool use_avx2_ipv6 = false;
+    bool use_prefetch_bursts = false;
+    bool use_bmi_optimizations = false;
+    
+    // Analyze packet patterns to select optimal instruction sequences
+    if (profile->packet_patterns.total_packets > 1000) {
+        uint64_t total = profile->packet_patterns.total_packets;
+        
+        // IPv4 optimization: Use AVX2 for parallel processing
+        if (caps.has_avx2 && (profile->packet_patterns.ipv4_packets * 100 / total) > 80) {
+            use_avx2_ipv4 = true;
+        }
+        
+        // IPv6 optimization: Use AVX2 256-bit operations for IPv6 addresses
+        if (caps.has_avx2 && (profile->packet_patterns.ipv6_packets * 100 / total) > 80) {
+            use_avx2_ipv6 = true;
+        }
+        
+        // Burst optimization: Use prefetch instructions
+        if (caps.has_prefetch && (profile->packet_patterns.burst_packets * 100 / total) > 40) {
+            use_prefetch_bursts = true;
+        }
+        
+        // BMI optimization: Use bit manipulation instructions for masks and shifts
+        if (caps.has_bmi1 && caps.has_bmi2) {
+            use_bmi_optimizations = true;
+        }
+    }
+    
+    // Emit specialized instruction sequences based on patterns
+    uint32_t pc = 0;
+    while (pc < len) {
+        uint8_t opcode = program[pc];
+        
+        switch (opcode) {
+            case VFM_EQ32:
+                if (use_avx2_ipv4) {
+                    // AVX2-optimized IPv4 address comparison
+                    emit_vmovdqu_ymm_mem(&jit, 0, RSI, 0);  // vmovdqu ymm0, [rsi]
+                    emit_vmovdqu_ymm_mem(&jit, 1, RDI, 0);  // vmovdqu ymm1, [rdi]
+                    emit_vpcmpeqd_ymm(&jit, 0, 0, 1);       // vpcmpeqd ymm0, ymm0, ymm1
+                    emit_vpmovmskb_reg_ymm(&jit, RAX, 0);   // vpmovmskb eax, ymm0
+                    // Test if all bytes are equal
+                    emit_cmp_reg_imm32(&jit, RAX, 0xFFFFFFFF);
+                    emit_sete_reg(&jit, RAX);
+                } else {
+                    // Standard 32-bit comparison
+                    emit_mov_reg_mem32(&jit, RAX, RSI, 0); // mov eax, [rsi]
+                    emit_cmp_reg_mem32(&jit, RAX, RDI, 0); // cmp eax, [rdi]
+                    emit_sete_reg(&jit, RAX);               // sete al
+                }
+                break;
+                
+            case VFM_EQ128:
+                if (use_avx2_ipv6) {
+                    // AVX2-optimized IPv6 address comparison
+                    emit_vmovdqu_xmm_mem(&jit, 0, RSI, 0);  // vmovdqu xmm0, [rsi]
+                    emit_vmovdqu_xmm_mem(&jit, 1, RDI, 0);  // vmovdqu xmm1, [rdi]
+                    emit_vpcmpeqb_xmm(&jit, 0, 0, 1);       // vpcmpeqb xmm0, xmm0, xmm1
+                    emit_vpmovmskb_reg_xmm(&jit, RAX, 0);   // vpmovmskb eax, xmm0
+                    // Test if all 16 bytes are equal
+                    emit_cmp_reg_imm32(&jit, RAX, 0xFFFF);
+                    emit_sete_reg(&jit, RAX);
+                } else {
+                    // Standard 128-bit comparison using SSE2
+                    emit_movdqu_xmm_mem(&jit, 0, RSI, 0);  // movdqu xmm0, [rsi]
+                    emit_movdqu_xmm_mem(&jit, 1, RDI, 0);  // movdqu xmm1, [rdi]
+                    emit_pcmpeqb_xmm(&jit, 0, 1);          // pcmpeqb xmm0, xmm1
+                    emit_pmovmskb_reg_xmm(&jit, RAX, 0);   // pmovmskb eax, xmm0
+                    emit_cmp_reg_imm32(&jit, RAX, 0xFFFF);
+                    emit_sete_reg(&jit, RAX);
+                }
+                break;
+                
+            case VFM_PUSH32:
+                if (use_prefetch_bursts) {
+                    // Burst-optimized push with prefetching
+                    emit_prefetcht0_mem(&jit, RSI, 64);    // prefetcht0 [rsi + 64]
+                    emit_mov_reg_mem32(&jit, RAX, RSI, 0); // mov eax, [rsi]
+                    emit_mov_mem32_reg(&jit, RDI, 0, RAX); // mov [rdi], eax
+                    emit_add_reg_imm(&jit, RDI, 4);        // add rdi, 4
+                } else {
+                    // Standard push
+                    emit_mov_reg_mem32(&jit, RAX, RSI, 0); // mov eax, [rsi]
+                    emit_mov_mem32_reg(&jit, RDI, 0, RAX); // mov [rdi], eax
+                }
+                break;
+                
+            case VFM_AND32:
+                if (use_bmi_optimizations) {
+                    // Use BMI instructions for bit manipulation
+                    emit_mov_reg_mem32(&jit, RAX, RSI, 0); // mov eax, [rsi]
+                    emit_mov_reg_mem32(&jit, RCX, RDI, 0); // mov ecx, [rdi]
+                    emit_andn_reg_reg_reg(&jit, RAX, RAX, RCX); // andn eax, eax, ecx
+                } else {
+                    // Standard AND operation
+                    emit_mov_reg_mem32(&jit, RAX, RSI, 0); // mov eax, [rsi]
+                    emit_and_reg_mem32(&jit, RAX, RDI, 0); // and eax, [rdi]
+                }
+                break;
+                
+            default:
+                // Use hot path optimization for frequently executed instructions
+                bool is_hot_path = false;
+                for (uint32_t i = 0; i < profile->hot_path_count; i++) {
+                    if (profile->hot_paths[i] == pc) {
+                        is_hot_path = true;
+                        break;
+                    }
+                }
+                
+                if (is_hot_path && use_prefetch_bursts) {
+                    // Add prefetch hints for hot paths
+                    emit_prefetcht0_mem(&jit, RSI, 32);
+                }
+                
+                // Standard opcode handling (simplified)
+                emit_nop(&jit); // nop (placeholder)
+                break;
+        }
+        
+        pc += vfm_instruction_size(opcode);
+        if (pc >= len) break;
+    }
+    
+    // Default return 0
+    emit_mov_reg_imm64(&jit, RAX, 0);
+    emit_epilogue(&jit);
+    
+    // Make memory executable
+    if (mprotect(code, code_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, code_size);
+        return NULL;
+    }
+    
+    return code;
+}

@@ -1653,9 +1653,24 @@ static void* worker_thread(void *arg) {
                 }
             }
             
+            // Phase 3.2.1: Profile-guided execution with runtime data collection
+            uint64_t execution_start = get_timestamp_ns();
+            
             // Execute filter (using existing vfm_execute logic)
             // For now, simplified execution - would use actual VFM interpreter
             int result = 1; // Placeholder: would call actual VFM execution
+            
+            uint64_t execution_cycles = get_timestamp_ns() - execution_start;
+            
+            // Update execution profile if available
+            if (shared->execution_profile) {
+                // Update profile for current instruction (simplified - using pc=0)
+                update_execution_profile(shared->execution_profile, core->hot.pc, 
+                                       result == 1, execution_cycles);
+                
+                // Analyze packet pattern for adaptive optimization
+                analyze_packet_pattern(shared->execution_profile, core->packet, core->hot.packet_len);
+            }
             
             ctx->results[i] = (uint8_t)result;
             core->hot.insn_count++;
@@ -1694,6 +1709,11 @@ vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
     mc_vm->shared->num_cores = num_cores;
     mc_vm->shared->numa_node = 0; // Default NUMA node
     mc_vm->shared->jit_enabled = true;
+    
+    // Phase 3.2: Initialize adaptive JIT optimization
+    mc_vm->shared->opt_level = VFM_JIT_OPT_BASIC;
+    mc_vm->shared->recompilation_threshold = 10000; // Recompile after 10k executions
+    mc_vm->shared->total_executions = 0;
     
     // Set platform-specific hints
     #ifdef VFM_APPLE_SILICON
@@ -1853,6 +1873,10 @@ int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *prog
     mc_vm->shared->program = program;
     mc_vm->shared->program_len = len;
     
+    // Phase 3.2: Initialize execution profile for adaptive optimization
+    uint32_t estimated_instruction_count = len; // Rough estimate
+    mc_vm->shared->execution_profile = create_execution_profile(estimated_instruction_count);
+    
     // Compile JIT code once for all cores
     if (mc_vm->shared->jit_enabled) {
         #ifdef __aarch64__
@@ -1863,6 +1887,7 @@ int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *prog
         
         if (mc_vm->shared->jit_code) {
             mc_vm->shared->jit_code_size = len * 32; // Estimated size
+            mc_vm->shared->opt_level = VFM_JIT_OPT_BASIC;
         }
     }
     
@@ -1936,6 +1961,40 @@ int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch
     }
     
     mc_vm->active_cores = 0;
+    
+    // Phase 3.2.1: Check for adaptive recompilation after batch execution
+    if (mc_vm->shared->execution_profile) {
+        mc_vm->shared->total_executions += batch->count;
+        
+        // Phase 3.2.4: Update adaptive thresholds periodically
+        static uint64_t threshold_update_counter = 0;
+        threshold_update_counter += batch->count;
+        
+        // Update thresholds every 5000 executions
+        if (threshold_update_counter >= 5000) {
+            update_adaptive_thresholds(mc_vm->shared);
+            threshold_update_counter = 0;
+        }
+        
+        // Check if we should trigger adaptive recompilation
+        if (should_recompile(mc_vm->shared)) {
+            // Trigger adaptive JIT recompilation with collected profile data
+            void *new_jit_code = adaptive_jit_recompile(mc_vm->shared, 
+                                                       mc_vm->shared->program, 
+                                                       mc_vm->shared->program_len);
+            if (new_jit_code) {
+                // Update all cores with new optimized JIT code
+                for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+                    // Note: In production, this would need proper synchronization
+                    // and cleanup of old JIT code
+                    mc_vm->cores[i]->jit_code = new_jit_code;
+                }
+                
+                // Reset execution count for next optimization cycle
+                mc_vm->shared->total_executions = 0;
+            }
+        }
+    }
     
     // Update global statistics
     mc_vm->global_stats.total_packets += batch->count;
@@ -2235,4 +2294,532 @@ static vfm_flow_entry_t* alloc_flow_table_numa(uint32_t size, uint32_t numa_node
     }
     
     return flow_table;
+}
+
+// ============================================================================
+// Phase 3.2: Adaptive JIT Optimization Implementation
+// ============================================================================
+
+// Initialize execution profile for adaptive optimization
+static vfm_execution_profile_t* create_execution_profile(uint32_t instruction_count) {
+    vfm_execution_profile_t *profile = calloc(1, sizeof(vfm_execution_profile_t));
+    if (!profile) return NULL;
+    
+    // Allocate per-instruction profiling arrays
+    profile->instruction_profiles = calloc(instruction_count, sizeof(vfm_instruction_profile_t));
+    if (!profile->instruction_profiles) {
+        free(profile);
+        return NULL;
+    }
+    
+    profile->instruction_count = instruction_count;
+    
+    // Initialize hot path tracking (limit to reasonable size)
+    profile->hot_path_count = 16; // Track top 16 hot paths
+    profile->hot_paths = calloc(profile->hot_path_count, sizeof(uint32_t));
+    
+    // Initialize branch hints
+    profile->branch_hints.hint_count = instruction_count / 4; // Estimate
+    profile->branch_hints.likely_taken = calloc(profile->branch_hints.hint_count, sizeof(uint32_t));
+    profile->branch_hints.likely_not_taken = calloc(profile->branch_hints.hint_count, sizeof(uint32_t));
+    
+    return profile;
+}
+
+// Free execution profile
+static void destroy_execution_profile(vfm_execution_profile_t *profile) {
+    if (!profile) return;
+    
+    free(profile->instruction_profiles);
+    free(profile->hot_paths);
+    free(profile->branch_hints.likely_taken);
+    free(profile->branch_hints.likely_not_taken);
+    free(profile);
+}
+
+// Update execution profile during runtime
+static void update_execution_profile(vfm_execution_profile_t *profile, uint32_t pc, 
+                                    bool branch_taken, uint64_t cycles) {
+    if (!profile || pc >= profile->instruction_count) return;
+    
+    vfm_instruction_profile_t *instr_profile = &profile->instruction_profiles[pc];
+    
+    // Update execution statistics
+    instr_profile->execution_count++;
+    instr_profile->cycle_count += cycles;
+    
+    // Update branch prediction data
+    if (branch_taken) {
+        instr_profile->branch_taken_count++;
+    } else {
+        instr_profile->branch_not_taken_count++;
+    }
+}
+
+// Analyze packet patterns for optimization hints
+// Phase 3.2.2: Enhanced packet pattern analysis for runtime optimization
+static void analyze_packet_pattern(vfm_execution_profile_t *profile, const uint8_t *packet, uint16_t len) {
+    if (!profile || !packet || len < 14) return;
+    
+    profile->packet_patterns.total_packets++;
+    
+    // Analyze Ethernet header and protocol distribution
+    uint16_t ethertype = (packet[12] << 8) | packet[13];
+    
+    if (ethertype == 0x0800) { // IPv4
+        profile->packet_patterns.ipv4_packets++;
+        
+        if (len >= 34) {
+            uint8_t protocol = packet[23];
+            
+            // Track specific protocol patterns for optimization hints
+            if (protocol == 6) { // TCP
+                profile->packet_patterns.tcp_packets++;
+                
+                // TCP-specific pattern analysis
+                if (len >= 54) {
+                    uint16_t tcp_flags = packet[47]; // TCP flags byte
+                    if (tcp_flags & 0x02) profile->packet_patterns.tcp_syn_packets++;
+                    if (tcp_flags & 0x10) profile->packet_patterns.tcp_ack_packets++;
+                }
+            } else if (protocol == 17) { // UDP
+                profile->packet_patterns.udp_packets++;
+                
+                // UDP pattern analysis - often used for DNS, streaming
+                if (len >= 42) {
+                    uint16_t dest_port = (packet[36] << 8) | packet[37];
+                    if (dest_port == 53 || dest_port == 5353) {
+                        profile->packet_patterns.dns_packets++;
+                    }
+                }
+            } else if (protocol == 1) { // ICMP
+                profile->packet_patterns.icmp_packets++;
+            } else {
+                profile->packet_patterns.other_packets++;
+            }
+            
+            // IPv4 address pattern analysis for flow optimization
+            uint32_t src_ip = (packet[26] << 24) | (packet[27] << 16) | (packet[28] << 8) | packet[29];
+            uint32_t dst_ip = (packet[30] << 24) | (packet[31] << 16) | (packet[32] << 8) | packet[33];
+            
+            // Track subnet patterns (simplified)
+            uint32_t src_subnet = src_ip & 0xFFFFFF00; // /24
+            uint32_t dst_subnet = dst_ip & 0xFFFFFF00;
+            
+            // Update most common source/destination subnets (simplified tracking)
+            if (profile->packet_patterns.common_src_subnet == 0) {
+                profile->packet_patterns.common_src_subnet = src_subnet;
+                profile->packet_patterns.src_subnet_count = 1;
+            } else if (profile->packet_patterns.common_src_subnet == src_subnet) {
+                profile->packet_patterns.src_subnet_count++;
+            }
+        }
+    } else if (ethertype == 0x86DD) { // IPv6
+        profile->packet_patterns.ipv6_packets++;
+        
+        if (len >= 54) {
+            uint8_t next_header = packet[20];
+            if (next_header == 6) {
+                profile->packet_patterns.tcp_packets++;
+                // IPv6 TCP analysis
+                if (len >= 74) {
+                    uint16_t tcp_flags = packet[67];
+                    if (tcp_flags & 0x02) profile->packet_patterns.tcp_syn_packets++;
+                    if (tcp_flags & 0x10) profile->packet_patterns.tcp_ack_packets++;
+                }
+            } else if (next_header == 17) {
+                profile->packet_patterns.udp_packets++;
+            } else if (next_header == 58) { // ICMPv6
+                profile->packet_patterns.icmpv6_packets++;
+            } else {
+                profile->packet_patterns.other_packets++;
+            }
+        }
+    } else {
+        profile->packet_patterns.other_packets++;
+    }
+    
+    // Packet size distribution analysis for optimization
+    if (len <= 64) profile->packet_patterns.small_packets++;
+    else if (len <= 512) profile->packet_patterns.medium_packets++;
+    else if (len <= 1500) profile->packet_patterns.large_packets++;
+    else profile->packet_patterns.jumbo_packets++;
+    
+    // Update average packet size
+    uint64_t total_size = profile->packet_patterns.average_packet_size * (profile->packet_patterns.total_packets - 1);
+    profile->packet_patterns.average_packet_size = (total_size + len) / profile->packet_patterns.total_packets;
+    
+    // Track packet arrival patterns for burst detection
+    static uint64_t last_packet_time = 0;
+    uint64_t current_time = get_timestamp_ns();
+    if (last_packet_time > 0) {
+        uint64_t inter_arrival = current_time - last_packet_time;
+        
+        // Simple burst detection (packets arriving within 1ms)
+        if (inter_arrival < 1000000) { // 1ms in nanoseconds
+            profile->packet_patterns.burst_packets++;
+        }
+    }
+    last_packet_time = current_time;
+}
+
+// Detect hot paths in execution
+static void detect_hot_paths(vfm_execution_profile_t *profile) {
+    if (!profile || !profile->instruction_profiles) return;
+    
+    // Find most frequently executed instructions
+    uint32_t hot_path_idx = 0;
+    for (uint32_t i = 0; i < profile->instruction_count && hot_path_idx < profile->hot_path_count; i++) {
+        if (profile->instruction_profiles[i].execution_count > 1000) { // Threshold
+            profile->hot_paths[hot_path_idx++] = i;
+        }
+    }
+}
+
+// Generate branch prediction hints based on profile data
+static void generate_branch_hints(vfm_execution_profile_t *profile) {
+    if (!profile) return;
+    
+    uint32_t taken_idx = 0, not_taken_idx = 0;
+    
+    for (uint32_t i = 0; i < profile->instruction_count; i++) {
+        vfm_instruction_profile_t *instr = &profile->instruction_profiles[i];
+        
+        uint32_t total_branches = instr->branch_taken_count + instr->branch_not_taken_count;
+        if (total_branches > 100) { // Sufficient sample size
+            double taken_ratio = (double)instr->branch_taken_count / total_branches;
+            
+            if (taken_ratio > 0.8 && taken_idx < profile->branch_hints.hint_count) {
+                // Branch is usually taken
+                profile->branch_hints.likely_taken[taken_idx++] = i;
+            } else if (taken_ratio < 0.2 && not_taken_idx < profile->branch_hints.hint_count) {
+                // Branch is usually not taken
+                profile->branch_hints.likely_not_taken[not_taken_idx++] = i;
+            }
+        }
+    }
+}
+
+// Phase 3.2.2: Adaptive JIT recompilation with packet pattern optimization
+static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program, uint32_t len) {
+    if (!shared || !shared->execution_profile) return NULL;
+    
+    vfm_execution_profile_t *profile = shared->execution_profile;
+    
+    // Analyze current profile data
+    detect_hot_paths(profile);
+    generate_branch_hints(profile);
+    
+    // Phase 3.2.2: Packet pattern-based optimization decisions
+    bool optimize_for_ipv4 = false;
+    bool optimize_for_ipv6 = false;
+    bool optimize_for_tcp = false;
+    bool optimize_for_small_packets = false;
+    bool optimize_for_bursts = false;
+    
+    // Determine optimization strategy based on packet patterns
+    if (profile->packet_patterns.total_packets > 1000) {
+        uint64_t total = profile->packet_patterns.total_packets;
+        
+        // IPv4 vs IPv6 optimization preference
+        double ipv4_ratio = (double)profile->packet_patterns.ipv4_packets / total;
+        double ipv6_ratio = (double)profile->packet_patterns.ipv6_packets / total;
+        
+        if (ipv4_ratio > 0.8) optimize_for_ipv4 = true;
+        else if (ipv6_ratio > 0.8) optimize_for_ipv6 = true;
+        
+        // TCP optimization for connection-heavy workloads
+        double tcp_ratio = (double)profile->packet_patterns.tcp_packets / total;
+        if (tcp_ratio > 0.7) optimize_for_tcp = true;
+        
+        // Small packet optimization for latency-sensitive workloads
+        double small_packet_ratio = (double)profile->packet_patterns.small_packets / total;
+        if (small_packet_ratio > 0.6) optimize_for_small_packets = true;
+        
+        // Burst optimization for high-throughput scenarios
+        double burst_ratio = (double)profile->packet_patterns.burst_packets / total;
+        if (burst_ratio > 0.4) optimize_for_bursts = true;
+    }
+    
+    // Free old JIT code
+    if (shared->jit_code) {
+        vfm_jit_free(shared->jit_code, shared->jit_code_size);
+        shared->jit_code = NULL;
+    }
+    
+    // Set optimization flags based on packet patterns
+    shared->hints.optimize_for_ipv4 = optimize_for_ipv4;
+    shared->hints.optimize_for_ipv6 = optimize_for_ipv6;
+    shared->hints.optimize_for_tcp = optimize_for_tcp;
+    shared->hints.optimize_for_small_packets = optimize_for_small_packets;
+    shared->hints.optimize_for_bursts = optimize_for_bursts;
+    
+    // Adjust prefetch strategy based on packet patterns
+    if (optimize_for_small_packets) {
+        shared->hints.prefetch_distance = 1; // Less aggressive for small packets
+    } else if (optimize_for_bursts) {
+        shared->hints.prefetch_distance = 3; // More aggressive for bursts
+    }
+    
+    // Recompile with profile-guided optimizations
+    #ifdef __aarch64__
+        // ARM64 JIT with profile-guided optimization
+        shared->jit_code = vfm_jit_compile_arm64_adaptive(program, len, profile);
+    #elif defined(__x86_64__)
+        // x86_64 JIT with profile-guided optimization  
+        shared->jit_code = vfm_jit_compile_x86_64_adaptive(program, len, profile);
+    #endif
+    
+    if (shared->jit_code) {
+        shared->jit_code_size = len * 32; // Estimated size
+        shared->opt_level = VFM_JIT_OPT_ADAPTIVE;
+    }
+    
+    return shared->jit_code;
+}
+
+// Check if recompilation is needed based on execution patterns
+static bool should_recompile(vfm_shared_context_t *shared) {
+    if (!shared || !shared->execution_profile) return false;
+    
+    vfm_execution_profile_t *profile = shared->execution_profile;
+    
+    // Primary trigger: Execution count threshold
+    if (shared->total_executions >= shared->recompilation_threshold) {
+        return true;
+    }
+    
+    // Advanced trigger: Hot path detection
+    // If we've identified hot paths that represent >80% of execution
+    if (profile->hot_path_count > 0) {
+        uint64_t total_hot_executions = 0;
+        uint64_t total_executions = 0;
+        
+        for (uint32_t i = 0; i < profile->instruction_count; i++) {
+            total_executions += profile->instruction_profiles[i].execution_count;
+        }
+        
+        for (uint32_t i = 0; i < profile->hot_path_count; i++) {
+            uint32_t hot_pc = profile->hot_paths[i];
+            if (hot_pc < profile->instruction_count) {
+                total_hot_executions += profile->instruction_profiles[hot_pc].execution_count;
+            }
+        }
+        
+        // Trigger recompilation if hot paths represent >80% of execution
+        if (total_executions > 1000 && 
+            total_hot_executions * 100 / total_executions > 80) {
+            return true;
+        }
+    }
+    
+    // Advanced trigger: Branch misprediction rate
+    // If branch prediction accuracy is <70%, consider recompilation for better hints
+    uint64_t total_branches = 0;
+    uint64_t correct_predictions = 0;
+    
+    for (uint32_t i = 0; i < profile->instruction_count; i++) {
+        vfm_instruction_profile_t *insn_prof = &profile->instruction_profiles[i];
+        uint64_t branch_count = insn_prof->branch_taken_count + insn_prof->branch_not_taken_count;
+        
+        if (branch_count > 0) {
+            total_branches += branch_count;
+            // Estimate correct predictions (simplified heuristic)
+            uint64_t max_branch_direction = (insn_prof->branch_taken_count > insn_prof->branch_not_taken_count) ?
+                insn_prof->branch_taken_count : insn_prof->branch_not_taken_count;
+            correct_predictions += max_branch_direction;
+        }
+    }
+    
+    if (total_branches > 1000 && correct_predictions * 100 / total_branches < 70) {
+        return true;
+    }
+    
+    return false;
+}
+
+// Phase 3.2.4: Adaptive compilation threshold adjustment
+static void adjust_recompilation_threshold(vfm_shared_context_t *shared) {
+    if (!shared || !shared->execution_profile) return;
+    
+    vfm_execution_profile_t *profile = shared->execution_profile;
+    
+    // Calculate performance metrics to guide threshold adjustment
+    uint64_t total_packets = profile->packet_patterns.total_packets;
+    if (total_packets < 1000) return; // Need sufficient data
+    
+    // Base threshold adjustment factors
+    double threshold_multiplier = 1.0;
+    
+    // Factor 1: Packet size distribution
+    // Small packets benefit from more frequent recompilation (lower threshold)
+    // Large packets can tolerate less frequent recompilation (higher threshold)
+    double small_packet_ratio = (double)profile->packet_patterns.small_packets / total_packets;
+    double large_packet_ratio = (double)profile->packet_patterns.large_packets / total_packets;
+    
+    if (small_packet_ratio > 0.7) {
+        threshold_multiplier *= 0.5; // Lower threshold for small packets
+    } else if (large_packet_ratio > 0.7) {
+        threshold_multiplier *= 2.0; // Higher threshold for large packets
+    }
+    
+    // Factor 2: Protocol distribution
+    // TCP-heavy workloads often have more stable patterns
+    double tcp_ratio = (double)profile->packet_patterns.tcp_packets / total_packets;
+    if (tcp_ratio > 0.8) {
+        threshold_multiplier *= 1.5; // Higher threshold for stable TCP workloads
+    }
+    
+    // Factor 3: Burst pattern analysis
+    // Burst traffic benefits from more frequent optimization
+    double burst_ratio = (double)profile->packet_patterns.burst_packets / total_packets;
+    if (burst_ratio > 0.5) {
+        threshold_multiplier *= 0.7; // Lower threshold for bursty traffic
+    }
+    
+    // Factor 4: Hot path concentration
+    // If execution is concentrated in few paths, recompile less frequently
+    if (profile->hot_path_count > 0) {
+        uint64_t total_hot_executions = 0;
+        uint64_t total_executions = 0;
+        
+        for (uint32_t i = 0; i < profile->instruction_count; i++) {
+            total_executions += profile->instruction_profiles[i].execution_count;
+        }
+        
+        for (uint32_t i = 0; i < profile->hot_path_count; i++) {
+            uint32_t hot_pc = profile->hot_paths[i];
+            if (hot_pc < profile->instruction_count) {
+                total_hot_executions += profile->instruction_profiles[hot_pc].execution_count;
+            }
+        }
+        
+        if (total_executions > 0) {
+            double hot_path_concentration = (double)total_hot_executions / total_executions;
+            if (hot_path_concentration > 0.9) {
+                threshold_multiplier *= 2.0; // Higher threshold for concentrated execution
+            }
+        }
+    }
+    
+    // Factor 5: Branch prediction performance
+    // Poor branch prediction benefits from frequent recompilation
+    uint64_t total_branches = 0;
+    uint64_t correct_predictions = 0;
+    
+    for (uint32_t i = 0; i < profile->instruction_count; i++) {
+        vfm_instruction_profile_t *insn_prof = &profile->instruction_profiles[i];
+        uint64_t branch_count = insn_prof->branch_taken_count + insn_prof->branch_not_taken_count;
+        
+        if (branch_count > 0) {
+            total_branches += branch_count;
+            uint64_t max_direction = (insn_prof->branch_taken_count > insn_prof->branch_not_taken_count) ?
+                insn_prof->branch_taken_count : insn_prof->branch_not_taken_count;
+            correct_predictions += max_direction;
+        }
+    }
+    
+    if (total_branches > 100) {
+        double prediction_accuracy = (double)correct_predictions / total_branches;
+        if (prediction_accuracy < 0.7) {
+            threshold_multiplier *= 0.6; // Lower threshold for poor branch prediction
+        } else if (prediction_accuracy > 0.95) {
+            threshold_multiplier *= 1.4; // Higher threshold for excellent prediction
+        }
+    }
+    
+    // Factor 6: Cache miss rate
+    // High cache miss rate benefits from more aggressive optimization
+    uint64_t total_cache_misses = 0;
+    uint64_t total_instructions = 0;
+    
+    for (uint32_t i = 0; i < profile->instruction_count; i++) {
+        total_cache_misses += profile->instruction_profiles[i].cache_misses;
+        total_instructions += profile->instruction_profiles[i].execution_count;
+    }
+    
+    if (total_instructions > 1000) {
+        double cache_miss_rate = (double)total_cache_misses / total_instructions;
+        if (cache_miss_rate > 0.05) { // 5% cache miss rate
+            threshold_multiplier *= 0.8; // Lower threshold for high cache misses
+        }
+    }
+    
+    // Apply threshold adjustment with bounds checking
+    uint32_t base_threshold = 10000; // Base threshold
+    uint32_t new_threshold = (uint32_t)(base_threshold * threshold_multiplier);
+    
+    // Enforce reasonable bounds
+    if (new_threshold < 1000) new_threshold = 1000;     // Minimum threshold
+    if (new_threshold > 100000) new_threshold = 100000; // Maximum threshold
+    
+    shared->recompilation_threshold = new_threshold;
+}
+
+// Phase 3.2.4: Adaptive optimization level adjustment
+static void adjust_optimization_level(vfm_shared_context_t *shared) {
+    if (!shared || !shared->execution_profile) return;
+    
+    vfm_execution_profile_t *profile = shared->execution_profile;
+    
+    // Start with current optimization level
+    vfm_jit_optimization_level_t new_opt_level = shared->opt_level;
+    
+    uint64_t total_packets = profile->packet_patterns.total_packets;
+    if (total_packets < 1000) return;
+    
+    // Determine if we should increase or decrease optimization aggressiveness
+    bool should_increase_opt = false;
+    bool should_decrease_opt = false;
+    
+    // Increase optimization for stable, high-volume workloads
+    double tcp_ratio = (double)profile->packet_patterns.tcp_packets / total_packets;
+    double large_packet_ratio = (double)profile->packet_patterns.large_packets / total_packets;
+    
+    if (tcp_ratio > 0.8 && large_packet_ratio > 0.6 && total_packets > 10000) {
+        should_increase_opt = true;
+    }
+    
+    // Decrease optimization for highly variable workloads
+    double burst_ratio = (double)profile->packet_patterns.burst_packets / total_packets;
+    double protocol_diversity = 0.0;
+    
+    // Calculate protocol diversity (simplified entropy measure)
+    if (total_packets > 0) {
+        double ipv4_ratio = (double)profile->packet_patterns.ipv4_packets / total_packets;
+        double ipv6_ratio = (double)profile->packet_patterns.ipv6_packets / total_packets;
+        double tcp_ratio_local = (double)profile->packet_patterns.tcp_packets / total_packets;
+        double udp_ratio = (double)profile->packet_patterns.udp_packets / total_packets;
+        
+        // Simple diversity measure: how evenly distributed are the protocols?
+        protocol_diversity = 1.0 - (ipv4_ratio * ipv4_ratio + ipv6_ratio * ipv6_ratio + 
+                                   tcp_ratio_local * tcp_ratio_local + udp_ratio * udp_ratio);
+    }
+    
+    if (burst_ratio > 0.6 || protocol_diversity > 0.5) {
+        should_decrease_opt = true;
+    }
+    
+    // Adjust optimization level
+    if (should_increase_opt && !should_decrease_opt) {
+        if (new_opt_level == VFM_JIT_OPT_BASIC) {
+            new_opt_level = VFM_JIT_OPT_AGGRESSIVE;
+        } else if (new_opt_level == VFM_JIT_OPT_AGGRESSIVE) {
+            new_opt_level = VFM_JIT_OPT_ADAPTIVE;
+        }
+    } else if (should_decrease_opt && !should_increase_opt) {
+        if (new_opt_level == VFM_JIT_OPT_ADAPTIVE) {
+            new_opt_level = VFM_JIT_OPT_AGGRESSIVE;
+        } else if (new_opt_level == VFM_JIT_OPT_AGGRESSIVE) {
+            new_opt_level = VFM_JIT_OPT_BASIC;
+        }
+    }
+    
+    shared->opt_level = new_opt_level;
+}
+
+// Phase 3.2.4: Comprehensive adaptive threshold update
+static void update_adaptive_thresholds(vfm_shared_context_t *shared) {
+    adjust_recompilation_threshold(shared);
+    adjust_optimization_level(shared);
 }
