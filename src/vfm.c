@@ -2057,11 +2057,18 @@ static int set_thread_affinity(pthread_t thread, uint32_t core_id) {
     
 #elif defined(__linux__)
     // Linux thread affinity using sched_setaffinity
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    
-    return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    #ifdef CPU_SETSIZE
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_id, &cpuset);
+        
+        return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    #else
+        // Fallback for systems without CPU affinity support (e.g., Alpine Linux/musl)
+        (void)thread;
+        (void)core_id;
+        return 0;  // Pretend success, no affinity support
+    #endif
     
 #else
     // Unsupported platform

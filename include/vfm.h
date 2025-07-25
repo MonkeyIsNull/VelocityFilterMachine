@@ -24,6 +24,7 @@
     #define _GNU_SOURCE
     #include <sched.h>
     #include <unistd.h>
+    #include <pthread.h>
 #endif
 
 #ifdef __cplusplus
