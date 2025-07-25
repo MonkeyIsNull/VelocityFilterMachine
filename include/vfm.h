@@ -22,10 +22,13 @@
 
 // Platform-specific system includes
 #ifdef VFM_PLATFORM_LINUX
-    #define _GNU_SOURCE
+    #ifndef _POSIX_C_SOURCE
+        #define _POSIX_C_SOURCE 200809L  /* For clock_gettime, strdup, and other POSIX functions */
+    #endif
     #include <sched.h>
     #include <unistd.h>
     #include <pthread.h>
+    #include <time.h>
 #endif
 
 #ifdef __cplusplus
@@ -796,12 +799,6 @@ typedef struct vfm_batch {
         return abs_time * timebase.numer / timebase.denom;
     }
 #else
-    #ifndef _POSIX_C_SOURCE
-        #define _POSIX_C_SOURCE 200809L  /* For clock_gettime and CLOCK_MONOTONIC */
-    #endif
-    #include <time.h>
-    #include <unistd.h>
-    
     static inline uint64_t vfm_get_time(void) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
