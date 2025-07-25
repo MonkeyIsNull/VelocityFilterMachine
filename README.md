@@ -6,9 +6,12 @@
 
 A high-performance packet filtering virtual machine in C, optimized for processing millions of packets per second. VFM features both a high-level Lisp-like DSL (VFLisp) for intuitive filter development and a low-level bytecode interpreter for maximum performance.
 
+
+At the moment, this is meant to be paired with [PacketVelocity](https://github.com/MonkeyIsNull/PacketVelocity) though it should be possible to use in another piece of software.
+
 ## Overview
 
-VFM is designed to be the fastest, safest packet filtering VM available. It combines:
+VFM is designed to be an extremley fast and safe packet filtering. It combines:
 
 - **VFLisp DSL**: High-level Lisp-like language for intuitive filter programming
 - **High Performance**: Optimized interpreter with computed goto dispatch achieving 10M+ packets/second
@@ -47,6 +50,9 @@ VFM is designed to be the fastest, safest packet filtering VM available. It comb
 git clone https://github.com/MonkeyIsNull/VelocityFilterMachine 
 cd VelocityFilterMachine
 make all
+
+# Install system-wide (optional)
+sudo make install  # Installs binaries to /usr/local/bin
 ```
 
 ### Apple Silicon (M1/M2/M3) Support
@@ -81,6 +87,8 @@ This builds:
 - `vfm-dis` - Disassembler (bytecode → text)
 - `vfm-test` - Filter testing tool
 
+When installed system-wide (`make install`), these tools are available from `/usr/local` and work seamlessly with PacketVelocity's `pcv.sh` script.
+
 ### Single Header Library
 For easy integration, use the single header version:
 ```c
@@ -90,7 +98,7 @@ For easy integration, use the single header version:
 
 ## Note
 
-Right now, this is very alpha software. You'll note there is no release and no version number. It is written with PacketVelocity in mind, which is currently unreleased, so your mileage may vary with other usage. Feel free to submit issues and PRs.
+Right now, this is very alpha software. You'll note there is no release and no version number. It is written with PacketVelocity in mind, which is also alphaware, so your mileage may vary with other usage. Feel free to submit issues and PRs.
 
 
 ## Quick Start
@@ -300,9 +308,11 @@ VFLisp provides an intuitive Lisp-like syntax for packet filtering:
 
 **Packet Fields:**
 - `proto` - IP protocol (6=TCP, 17=UDP, 1=ICMP)
-- `src-ip`, `dst-ip` - IP addresses
-- `src-port`, `dst-port` - Port numbers
-- `ethertype` - Ethernet frame type (0x0800=IPv4)
+- `ip-version` - IP version (4=IPv4, 6=IPv6)
+- `src-ip4`, `dst-ip4` - IPv4 addresses (32-bit)
+- `src-ip6`, `dst-ip6` - IPv6 addresses (128-bit) 
+- `src-port`, `dst-port` - Port numbers (works with both IPv4/IPv6)
+- `ethertype` - Ethernet frame type (0x0800=IPv4, 0x86DD=IPv6)
 - `ip-len` - IP packet length
 - `tcp-flags` - TCP flags byte
 
@@ -328,15 +338,21 @@ VFLisp provides an intuitive Lisp-like syntax for packet filtering:
 
 **Example Filters:**
 ```lisp
-; Accept only TCP traffic
-(= proto 6)
+; IPv4 Examples
+(= proto 6)                                    ; Accept only TCP traffic
+(and (= proto 6) (or (= dst-port 80) (= dst-port 443))) ; Web traffic (HTTP/HTTPS)
+(= src-ip4 192.168.1.1)                       ; Specific IPv4 source
 
-; Web traffic (HTTP/HTTPS)
-(and (= proto 6)
-     (or (= dst-port 80) (= dst-port 443)))
+; IPv6 Examples  
+(= ip-version 6)                               ; All IPv6 traffic
+(= src-ip6 ::1)                               ; IPv6 loopback source
+(= dst-ip6 2001:db8::1)                       ; Specific IPv6 destination
+(and (= ip-version 6) (= proto 6))            ; IPv6 TCP traffic
 
-; Block large UDP packets
-(not (and (= proto 17) (> ip-len 1400)))
+; Mixed IPv4/IPv6 Examples
+(or (= src-port 80) (= dst-port 80))          ; HTTP on either IP version
+(and (= proto 17) (> ip-len 1400))            ; Large UDP packets (IPv4 or IPv6)
+(not (= ip-version 4))                        ; Block all IPv4 traffic
 ```
 
 ### Assembly Language Reference
@@ -347,9 +363,11 @@ For advanced users, VFM also supports low-level assembly programming:
 - `LD16 offset` - Load 16-bit value (network order)
 - `LD32 offset` - Load 32-bit value (network order)
 - `LD64 offset` - Load 64-bit value (network order)
+- `LD128 offset` - Load 128-bit value (IPv6 addresses)
 
 **Stack Operations:**
 - `PUSH value` - Push 64-bit immediate
+- `PUSH128 addr` - Push 128-bit immediate (IPv6 addresses)
 - `POP` - Pop top value
 - `DUP` - Duplicate top value
 - `SWAP` - Swap top two values
@@ -358,6 +376,8 @@ For advanced users, VFM also supports low-level assembly programming:
 - `ADD`, `SUB`, `MUL`, `DIV`, `MOD`
 - `AND`, `OR`, `XOR`, `NOT`
 - `SHL`, `SHR` - Bit shifting
+- `EQ128`, `NE128` - 128-bit comparisons (IPv6)
+- `AND128`, `OR128`, `XOR128` - 128-bit bitwise operations
 
 **Control Flow:**
 - `JMP offset` - Unconditional jump
@@ -410,9 +430,10 @@ VFM achieves exceptional performance through:
 - **JIT Compilation**: Native code generation for hot paths
 
 Benchmark results on Apple M1:
-- **VFLisp filters**: 20M+ packets/second
+- **VFLisp IPv4 filters**: 20M+ packets/second
+- **VFLisp IPv6 filters**: 15M+ packets/second (with JIT)
 - **Assembly filters**: 25M+ packets/second
-- **Complex filters**: 10M+ packets/second
+- **Complex IPv6 filters**: 10M+ packets/second
 - **Memory usage**: <1MB per VM instance
 
 ## Security
