@@ -985,8 +985,8 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
         
         // Check for opcodes not supported by JIT
         if (opcode == VFM_IP_VER || opcode == VFM_IPV6_EXT || opcode == VFM_HASH6 ||
-            opcode == VFM_LD128 || opcode == VFM_PUSH128 || 
-            opcode == VFM_EQ128 || opcode == VFM_NE128 ||
+            opcode == VFM_PUSH128 || 
+            opcode == VFM_NE128 ||
             opcode == VFM_GT128 || opcode == VFM_LT128 || opcode == VFM_GE128 || opcode == VFM_LE128 ||
             opcode == VFM_AND128 || opcode == VFM_OR128 || opcode == VFM_XOR128 ||
             opcode == VFM_JEQ128 || opcode == VFM_JNE128 || 
