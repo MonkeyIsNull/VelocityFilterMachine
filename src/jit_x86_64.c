@@ -439,6 +439,14 @@ static void emit_vpcmpeqb_xmm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint
     #endif
 }
 
+static void emit_vpcmpeqd_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
+    #ifdef VFM_PLATFORM_LINUX
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #else
+        (void)jit; (void)dst; (void)src1; (void)src2;
+    #endif
+}
+
 static void emit_vpmovmskb_reg_xmm(x86_64_jit_t *jit, uint8_t reg, uint8_t xmm) {
     #ifdef VFM_PLATFORM_LINUX
         (void)jit; (void)reg; (void)xmm;
