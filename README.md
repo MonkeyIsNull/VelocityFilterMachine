@@ -17,7 +17,7 @@ VFM is designed to be an extremley fast and safe packet filtering. It combines:
 - **High Performance**: Optimized interpreter with computed goto dispatch achieving 10M+ packets/second
 - **Safety First**: Static program verification prevents crashes and ensures bounded execution
 - **Zero-Copy**: Direct packet access without memory copying for maximum throughput
-- **Cross-Platform**: Runs on Linux, macOS, and BSD systems
+- **Cross-Platform**: Runs on Linux, macOS, and BSD systems (see Linux compatibility notes below)
 - **BPF Compatible**: Compiles VFM bytecode to native BPF for kernel integration
 - **JIT Compilation**: x86-64 and ARM64 JIT compilers for maximum performance
 
@@ -79,6 +79,47 @@ codesign -d --entitlements :- tools/vfm-test
 # Sign for distribution (replace with your certificate)
 codesign --entitlements entitlements.plist -s "Developer ID Application: Your Name-Blah-blah-blah" tools/vfm-test
 ```
+
+### Linux Compatibility
+
+**Current Status**: Linux compilation is supported with limited JIT functionality.
+
+**What Works:**
+- Core VFM interpreter and bytecode execution
+- VFLisp DSL compilation and execution  
+- All command-line tools (vfm-asm, vfm-dis, vfm-test, vflispc)
+- Cross-platform printf format compatibility
+- ARM64 JIT compilation (basic implementation)
+
+**What's Limited:**
+- x86_64 JIT compilation (stub implementation only)
+- Advanced AVX2/SSE optimizations disabled
+- CPU affinity optimizations disabled
+
+**Performance on Linux:**
+- Interpreter mode: Full performance (10M+ packets/second)
+- ARM64 systems: JIT available with good performance
+- x86_64 systems: Falls back to interpreter (still high performance)
+
+**Building on Linux:**
+```bash
+# Alpine Linux / musl
+apk add build-base gcc make
+
+# Ubuntu/Debian
+apt-get install build-essential
+
+# Build normally
+make clean && make
+```
+
+**Future Plans:**
+- Complete x86_64 JIT implementation for Linux
+- Full AVX2/SSE optimization support
+- CPU affinity and NUMA optimizations
+- Advanced profiling and performance monitoring
+
+The core functionality is fully operational on Linux systems. JIT optimizations will be added in upcoming releases.
 
 This builds:
 - `libvfm.a` - Core VFM library
@@ -466,5 +507,5 @@ MIT License - see LICENSE file for details.
 - **Latency**: <50ns per packet overhead
 - **Memory**: <1MB per VM instance
 - **Safety**: Zero crashes on malformed bytecode
-- **Compatibility**: Runs on Linux, macOS, BSD
+- **Compatibility**: Runs on Linux (with limited JIT), macOS (full JIT), BSD
 
