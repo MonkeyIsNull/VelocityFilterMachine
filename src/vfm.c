@@ -1908,8 +1908,11 @@ int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch
         workers[i].work_cond = &work_cond;
         workers[i].work_ready = true;
         
-        // Create thread
-        if (pthread_create(&mc_vm->threads[i], NULL, worker_thread, &workers[i]) != 0) {
+        // Create thread with affinity if enabled
+        void* (*thread_func)(void*) = mc_vm->shared->hints.use_prefetch ? 
+                                     worker_thread_with_affinity : worker_thread;
+        
+        if (pthread_create(&mc_vm->threads[i], NULL, thread_func, &workers[i]) != 0) {
             // Cleanup on thread creation failure
             for (uint32_t j = 0; j < i; j++) {
                 pthread_cancel(mc_vm->threads[j]);
@@ -1965,4 +1968,271 @@ void vfm_multicore_get_stats(const vfm_multicore_state_t *mc_vm, vfm_stats_t *st
     stats->total_execution_time_ns = get_timestamp_ns(); // Would track actual execution time
     stats->avg_instructions_per_packet = stats->packets_processed > 0 ? 
         (double)stats->instructions_executed / stats->packets_processed : 0.0;
+}
+
+// ============================================================================
+// Phase 3.1.3: Platform-specific thread affinity
+// ============================================================================
+
+// Set thread affinity to a specific CPU core
+static int set_thread_affinity(pthread_t thread, uint32_t core_id) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS thread affinity using thread_policy_set
+    thread_affinity_policy_data_t policy = { core_id };
+    kern_return_t result = thread_policy_set(pthread_mach_thread_np(thread),
+                                            THREAD_AFFINITY_POLICY,
+                                            (thread_policy_t)&policy,
+                                            THREAD_AFFINITY_POLICY_COUNT);
+    return (result == KERN_SUCCESS) ? 0 : -1;
+    
+#elif defined(__linux__)
+    // Linux thread affinity using sched_setaffinity
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    
+    return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    
+#else
+    // Unsupported platform
+    (void)thread;
+    (void)core_id;
+    return -1;
+#endif
+}
+
+// Get current thread affinity
+static int get_thread_affinity(pthread_t thread, uint32_t *core_id) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS: Get thread affinity policy
+    thread_affinity_policy_data_t policy;
+    mach_msg_type_number_t count = THREAD_AFFINITY_POLICY_COUNT;
+    boolean_t get_default = FALSE;
+    
+    kern_return_t result = thread_policy_get(pthread_mach_thread_np(thread),
+                                            THREAD_AFFINITY_POLICY,
+                                            (thread_policy_t)&policy,
+                                            &count, &get_default);
+    if (result == KERN_SUCCESS) {
+        *core_id = policy.affinity_tag;
+        return 0;
+    }
+    return -1;
+    
+#elif defined(__linux__)
+    // Linux: Get thread affinity using sched_getaffinity
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    if (pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset) == 0) {
+        // Find first set CPU
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &cpuset)) {
+                *core_id = (uint32_t)i;
+                return 0;
+            }
+        }
+    }
+    return -1;
+    
+#else
+    // Unsupported platform
+    (void)thread;
+    (void)core_id;
+    return -1;
+#endif
+}
+
+// Enhanced worker thread function with affinity
+static void* worker_thread_with_affinity(void *arg) {
+    worker_context_t *ctx = (worker_context_t*)arg;
+    vfm_core_context_t *core = ctx->core_ctx;
+    
+    // Set thread affinity to specific core
+    if (set_thread_affinity(pthread_self(), ctx->thread_id) == 0) {
+        // Successfully set affinity
+    }
+    
+    // Call the regular worker thread implementation
+    return worker_thread(arg);
+}
+
+// Configure thread affinity for multi-core VFM
+int vfm_multicore_set_thread_affinity(vfm_multicore_state_t *mc_vm, bool enable) {
+    if (!mc_vm) return VFM_ERROR_INVALID_PROGRAM;
+    
+    // This setting will be applied when threads are created
+    mc_vm->shared->hints.use_prefetch = enable; // Reuse existing hint field for simplicity
+    
+    return VFM_SUCCESS;
+}
+
+// Set NUMA node for memory allocation
+int vfm_multicore_set_numa_node(vfm_multicore_state_t *mc_vm, uint32_t numa_node) {
+    if (!mc_vm || !mc_vm->shared) return VFM_ERROR_INVALID_PROGRAM;
+    
+    mc_vm->shared->numa_node = numa_node;
+    
+    // On macOS, we can set memory policy preferences
+#ifdef VFM_PLATFORM_MACOS
+    // macOS doesn't have explicit NUMA APIs, but we can set memory preferences
+    // This is more of a hint to the system
+    return VFM_SUCCESS;
+    
+#elif defined(__linux__)
+    // Linux: Set NUMA memory policy using numactl APIs
+    // This would require linking with libnuma
+    // For now, just store the preference
+    return VFM_SUCCESS;
+    
+#else
+    return VFM_SUCCESS;
+#endif
+}
+
+// ============================================================================
+// Phase 3.1.4: NUMA-aware memory allocation
+// ============================================================================
+
+// Get NUMA topology information
+static int get_numa_node_count(void) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS doesn't expose NUMA topology directly
+    // But Apple Silicon has unified memory architecture
+    return 1;
+    
+#elif defined(__linux__)
+    // Linux: Check /sys/devices/system/node/ for NUMA nodes
+    // For simplicity, assume single NUMA node for now
+    // Real implementation would use libnuma
+    return 1;
+    
+#else
+    return 1;
+#endif
+}
+
+// Allocate memory on specific NUMA node
+static void* numa_alloc_on_node(size_t size, uint32_t numa_node, size_t alignment) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS: Use standard aligned allocation (unified memory architecture)
+    (void)numa_node; // Unused on macOS
+    if (alignment > 0) {
+        return aligned_alloc(alignment, size);
+    } else {
+        return malloc(size);
+    }
+    
+#elif defined(__linux__)
+    // Linux: Would use numa_alloc_onnode() from libnuma
+    // For now, fall back to standard allocation
+    (void)numa_node;
+    if (alignment > 0) {
+        return aligned_alloc(alignment, size);
+    } else {
+        return malloc(size);
+    }
+    
+#else
+    (void)numa_node;
+    if (alignment > 0) {
+        return aligned_alloc(alignment, size);
+    } else {
+        return malloc(size);
+    }
+#endif
+}
+
+// Free NUMA-allocated memory
+static void numa_free(void *ptr, size_t size) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS: Standard free
+    (void)size;
+    free(ptr);
+    
+#elif defined(__linux__)
+    // Linux: Would use numa_free() from libnuma
+    // For now, use standard free
+    (void)size;
+    free(ptr);
+    
+#else
+    (void)size;
+    free(ptr);
+#endif
+}
+
+// Get CPU to NUMA node mapping
+static uint32_t get_cpu_numa_node(uint32_t cpu_id) {
+#ifdef VFM_PLATFORM_MACOS
+    // macOS: Apple Silicon has unified memory
+    (void)cpu_id;
+    return 0;
+    
+#elif defined(__linux__)
+    // Linux: Would read /sys/devices/system/cpu/cpuX/numa_node
+    // For now, assume all CPUs on node 0
+    (void)cpu_id;
+    return 0;
+    
+#else
+    (void)cpu_id;
+    return 0;
+#endif
+}
+
+// Enhanced core context allocation with NUMA awareness
+static vfm_core_context_t* alloc_core_context_numa(uint32_t core_id, uint32_t numa_node) {
+    // Determine NUMA node for this core
+    uint32_t target_numa_node = (numa_node != UINT32_MAX) ? numa_node : get_cpu_numa_node(core_id);
+    
+    // Allocate core context on the target NUMA node
+    vfm_core_context_t *core_ctx = numa_alloc_on_node(sizeof(vfm_core_context_t), 
+                                                      target_numa_node, 
+                                                      VFM_CACHE_LINE_SIZE);
+    if (!core_ctx) return NULL;
+    
+    memset(core_ctx, 0, sizeof(vfm_core_context_t));
+    
+    // Allocate per-core stack on the same NUMA node with cache line alignment
+    core_ctx->stack_size = VFM_STACK_SIZE;
+    core_ctx->stack = numa_alloc_on_node(VFM_STACK_SIZE * sizeof(uint64_t), 
+                                        target_numa_node, 
+                                        128); // 128-byte alignment for cache efficiency
+    
+    if (!core_ctx->stack) {
+        numa_free(core_ctx, sizeof(vfm_core_context_t));
+        return NULL;
+    }
+    
+    core_ctx->core_id = core_id;
+    memset(&core_ctx->flow_stats, 0, sizeof(vfm_flow_stats_t));
+    
+    return core_ctx;
+}
+
+// Free NUMA-aware core context
+static void free_core_context_numa(vfm_core_context_t *core_ctx) {
+    if (!core_ctx) return;
+    
+    if (core_ctx->stack) {
+        numa_free(core_ctx->stack, VFM_STACK_SIZE * sizeof(uint64_t));
+    }
+    
+    numa_free(core_ctx, sizeof(vfm_core_context_t));
+}
+
+// Enhanced flow table allocation with NUMA awareness
+static vfm_flow_entry_t* alloc_flow_table_numa(uint32_t size, uint32_t numa_node) {
+    size_t table_size = size * sizeof(vfm_flow_entry_t);
+    
+    // Allocate flow table on specified NUMA node
+    vfm_flow_entry_t *flow_table = numa_alloc_on_node(table_size, numa_node, VFM_CACHE_LINE_SIZE);
+    
+    if (flow_table) {
+        // Initialize all atomic fields to zero
+        memset(flow_table, 0, table_size);
+    }
+    
+    return flow_table;
 }
