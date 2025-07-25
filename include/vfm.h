@@ -796,10 +796,10 @@ typedef struct vfm_batch {
         return abs_time * timebase.numer / timebase.denom;
     }
 #else
-    #include <time.h>
-    #ifndef _GNU_SOURCE
-        #define _GNU_SOURCE
+    #ifndef _POSIX_C_SOURCE
+        #define _POSIX_C_SOURCE 200809L  /* For clock_gettime and CLOCK_MONOTONIC */
     #endif
+    #include <time.h>
     #include <unistd.h>
     
     static inline uint64_t vfm_get_time(void) {
