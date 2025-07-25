@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -155,6 +156,11 @@ enum vfm_opcode {
     VFM_IPV6_EXT,// Extract IPv6 extension header field
     VFM_HASH6,   // Hash IPv6 5-tuple
 
+    // ARM64 NEON optimized operations for Phase 2.1.3
+    VFM_BULK_LOAD128,    // Bulk load multiple 128-bit values using NEON LDP
+    VFM_PARALLEL_EQ128,  // Parallel comparison of multiple 128-bit pairs
+    VFM_STACK_PREFETCH,  // Prefetch stack regions for cache optimization
+
     VFM_OPCODE_MAX
 };
 
@@ -169,14 +175,199 @@ typedef enum {
     VFM_FMT_OFFSET16   // 16-bit offset (for jumps and packet access)
 } vfm_format_t;
 
-// Flow table entry
+// Phase 2.3: Flow table statistics for performance monitoring
+typedef struct vfm_flow_stats {
+    uint64_t lookups;       // Total number of lookups
+    uint64_t hits;          // Successful lookups
+    uint64_t misses;        // Failed lookups
+    uint64_t collisions;    // Hash collisions
+    uint64_t evictions;     // LRU evictions
+    uint32_t load_factor;   // Current load percentage (0-100)
+    double hit_rate;        // Cache hit rate (0.0-1.0)
+} vfm_flow_stats_t;
+
+// Phase 3.2: Adaptive JIT optimization structures
+typedef struct vfm_instruction_profile {
+    uint64_t execution_count;      // How many times this instruction was executed
+    uint64_t cycle_count;          // Estimated CPU cycles consumed
+    uint32_t branch_taken_count;   // For conditional instructions
+    uint32_t branch_not_taken_count;
+    uint32_t cache_misses;         // Memory access pattern data
+    uint32_t _pad;                 // Padding
+} vfm_instruction_profile_t;
+
+typedef struct vfm_execution_profile {
+    // Per-instruction profiling data
+    vfm_instruction_profile_t *instruction_profiles;
+    uint32_t instruction_count;
+    
+    // Hot path detection
+    uint32_t *hot_paths;           // Most frequently executed instruction sequences
+    uint32_t hot_path_count;
+    
+    // Packet pattern analysis - Phase 3.2.2 enhanced patterns
+    struct {
+        uint64_t ipv4_packets;     // IPv4 vs IPv6 packet distribution
+        uint64_t ipv6_packets;
+        uint64_t tcp_packets;      // Protocol distribution
+        uint64_t udp_packets;
+        uint64_t icmp_packets;     // ICMP packets
+        uint64_t icmpv6_packets;   // ICMPv6 packets
+        uint64_t dns_packets;      // DNS packets (UDP port 53/5353)
+        uint64_t other_packets;
+        
+        // TCP-specific patterns
+        uint64_t tcp_syn_packets;  // TCP SYN packets
+        uint64_t tcp_ack_packets;  // TCP ACK packets
+        
+        // Packet size distribution
+        uint64_t small_packets;    // <= 64 bytes
+        uint64_t medium_packets;   // 65-512 bytes
+        uint64_t large_packets;    // 513-1500 bytes
+        uint64_t jumbo_packets;    // > 1500 bytes
+        
+        // Network patterns
+        uint32_t common_src_subnet; // Most common source subnet (/24)
+        uint32_t src_subnet_count;   // Count for common subnet
+        uint64_t burst_packets;      // Packets in bursts (< 1ms apart)
+        
+        uint64_t average_packet_size;
+        uint64_t total_packets;
+    } packet_patterns;
+    
+    // Branch prediction hints
+    struct {
+        uint32_t *likely_taken;    // Instructions where branches are usually taken
+        uint32_t *likely_not_taken;
+        uint32_t hint_count;
+    } branch_hints;
+    
+    // Memory access patterns
+    struct {
+        uint64_t stack_accesses;   // Stack vs heap access patterns
+        uint64_t heap_accesses;
+        uint64_t flow_table_hits;
+        uint64_t flow_table_misses;
+    } memory_patterns;
+    
+} vfm_execution_profile_t;
+
+// JIT optimization levels
+typedef enum {
+    VFM_JIT_OPT_NONE = 0,         // No optimization
+    VFM_JIT_OPT_BASIC = 1,        // Basic optimizations
+    VFM_JIT_OPT_ADAPTIVE = 2,     // Profile-guided optimization
+    VFM_JIT_OPT_AGGRESSIVE = 3    // Maximum optimization
+} vfm_jit_optimization_level_t;
+
+// Phase 3.1: Multi-core VFM architecture
+typedef struct vfm_core_context {
+    // Core-local execution state - must be isolated per thread
+    struct {
+        uint32_t pc;                // Program counter
+        uint32_t insn_count;        // Instructions executed
+        uint32_t insn_limit;        // Instruction limit
+        vfm_error_t error;          // Execution error state
+        uint32_t sp;                // Stack pointer
+        uint16_t packet_len;        // Current packet length
+        uint16_t _pad1;             // Padding
+    } VFM_CACHE_ALIGNED hot;
+    
+    // Core-local packet data
+    const uint8_t *packet;          // Current packet being processed
+    
+    // Per-core stack - isolated to prevent false sharing
+    uint64_t *stack VFM_ALIGNED(128);  // Aligned to cache line
+    uint32_t stack_size;
+    uint32_t core_id;               // Core identifier
+    
+    // Per-core registers - isolated per thread
+    uint64_t regs[16] VFM_CACHE_ALIGNED;
+    
+    // Core-local flow statistics
+    vfm_flow_stats_t flow_stats VFM_CACHE_ALIGNED;
+    
+} VFM_CACHE_ALIGNED vfm_core_context_t;
+
+// Shared read-only data across all cores
+typedef struct vfm_shared_context {
+    // Program data (read-only, shared across cores)
+    const uint8_t *program;
+    uint32_t program_len;
+    uint32_t _pad1;
+    
+    // Shared JIT cache (thread-safe access)
+    void *jit_code;
+    size_t jit_code_size;
+    bool jit_enabled;
+    struct vfm_jit_cache_entry *jit_cache_entry;
+    
+    // Platform hints (read-only after initialization)
+    struct {
+        bool use_prefetch;
+        bool use_huge_pages;
+        uint8_t prefetch_distance;
+        
+        // Phase 3.2.2: Packet pattern optimization flags
+        bool optimize_for_ipv4;        // Optimize for IPv4-heavy workloads
+        bool optimize_for_ipv6;        // Optimize for IPv6-heavy workloads
+        bool optimize_for_tcp;         // Optimize for TCP-heavy workloads
+        bool optimize_for_small_packets; // Optimize for small packet workloads
+        bool optimize_for_bursts;      // Optimize for burst traffic patterns
+        uint8_t _pad[0];               // No padding needed now
+    } hints;
+    
+    // Multi-core configuration
+    uint32_t num_cores;             // Number of cores to use
+    uint32_t numa_node;             // NUMA node for memory allocation
+    
+    // Phase 3.2: Adaptive JIT optimization
+    vfm_execution_profile_t *execution_profile;  // Runtime profiling data
+    vfm_jit_optimization_level_t opt_level;      // Current optimization level
+    uint32_t recompilation_threshold;            // When to trigger recompilation
+    uint64_t total_executions;                   // Total filter executions
+    
+} VFM_CACHE_ALIGNED vfm_shared_context_t;
+
+// Phase 3.1.2: Lock-free flow table entry with atomic operations
 typedef struct vfm_flow_entry {
-    uint64_t key;
-    uint64_t value;
-    uint64_t last_seen;
+    _Atomic(uint64_t) key;           // Hash key (atomic for lock-free access)
+    _Atomic(uint64_t) value;         // Associated value (atomic)
+    _Atomic(uint64_t) last_seen;     // Timestamp for LRU eviction (atomic)
+    _Atomic(uint32_t) collision_count; // Number of collisions for this slot (atomic)
+    uint32_t _pad;                   // Padding to 32-byte alignment
 } VFM_CACHE_ALIGNED vfm_flow_entry_t;
 
-// VM state structure - optimized for cache locality
+// Phase 3.1: Multi-core VFM state structure
+typedef struct vfm_multicore_state {
+    // Shared context (read-only after initialization)
+    vfm_shared_context_t *shared;
+    
+    // Per-core contexts (one per thread)
+    vfm_core_context_t **cores;
+    
+    // Shared flow table (thread-safe access required)
+    vfm_flow_entry_t *flow_table;
+    uint32_t flow_table_mask;
+    
+    // Multi-threading configuration
+    uint32_t num_cores;
+    uint32_t active_cores;          // Currently active cores
+    
+    // Thread management
+    pthread_t *threads;             // Worker threads
+    volatile bool shutdown;         // Shutdown signal
+    
+    // Performance monitoring across all cores
+    struct {
+        uint64_t total_packets;     // Total packets processed
+        uint64_t total_instructions; // Total instructions executed
+        uint64_t core_utilization[16]; // Per-core utilization (max 16 cores)
+    } global_stats;
+    
+} VFM_CACHE_ALIGNED vfm_multicore_state_t;
+
+// Legacy single-core VM state structure - optimized for cache locality
 typedef struct vfm_state {
     // Hot data - frequently accessed during execution
     struct {
@@ -192,6 +383,21 @@ typedef struct vfm_state {
         // Packet bounds (hot for bounds checking)
         uint16_t packet_len;
         uint16_t _pad1;  // Padding for alignment
+        
+        // Flow state table (moved to hot for Phase 2.3 cache optimization)
+        vfm_flow_entry_t *flow_table;
+        uint32_t flow_table_mask;  // Size - 1 for fast modulo
+        
+        // Phase 2.3: Flow table performance tracking
+        struct {
+            uint64_t lookups;       // Total number of lookups
+            uint64_t hits;          // Successful lookups
+            uint64_t misses;        // Failed lookups
+            uint64_t collisions;    // Hash collisions
+            uint64_t evictions;     // LRU evictions
+            uint32_t load_factor;   // Current load percentage (0-100)
+            uint32_t _pad;          // Padding
+        } flow_stats;
     } VFM_CACHE_ALIGNED hot;
     
     // Packet data pointer (read-only)
@@ -210,16 +416,12 @@ typedef struct vfm_state {
     // Registers (faster than pure stack) - cache line aligned
     uint64_t regs[16] VFM_CACHE_ALIGNED;
     
-    // Flow state table (optional) - for stateful filtering
-    vfm_flow_entry_t *flow_table;
-    uint32_t flow_table_mask;  // Size - 1 for fast modulo
-    uint32_t _pad4;  // Padding
-    
     // JIT compilation cache
     void *jit_code;             // Compiled native code (NULL if not compiled)
     size_t jit_code_size;       // Size of JIT code for cleanup
     bool jit_enabled;           // Whether to attempt JIT compilation
-    uint8_t _pad_jit[7];        // Padding to 8 bytes
+    struct vfm_jit_cache_entry *jit_cache_entry;  // Reference to cached entry
+    uint8_t _pad_jit[3];        // Padding adjustment
     
     // Platform-specific optimization hints
     struct {
@@ -229,6 +431,55 @@ typedef struct vfm_state {
         uint8_t _pad[5];        // Padding to 8 bytes
     } hints;
 } vfm_state_t;
+
+// JIT Cache Configuration
+#define VFM_JIT_CACHE_MAX_ENTRIES 1024        // Maximum cached programs
+#define VFM_JIT_CACHE_MAX_MEMORY_MB 64        // Maximum memory usage
+#define VFM_JIT_CACHE_BUCKET_COUNT 256        // Hash table buckets
+#define VFM_JIT_CACHE_POOL_SIZES 4            // Number of pool sizes
+
+// JIT Cache Data Structures
+typedef struct vfm_program_hash {
+    uint32_t hash_high;     // Upper 32 bits of program hash
+    uint32_t hash_low;      // Lower 32 bits of program hash
+    uint32_t length;        // Program length for collision detection
+    uint32_t checksum;      // Simple XOR checksum for fast validation
+} vfm_program_hash_t;
+
+typedef struct vfm_jit_cache_entry {
+    vfm_program_hash_t program_hash;   // Program identifier
+    void *jit_code;                    // Compiled native code
+    size_t jit_code_size;              // Actual size of compiled code
+    uint32_t ref_count;                // Reference counting for cleanup
+    uint32_t _pad1;                    // Padding
+    uint64_t last_used;                // Timestamp for LRU eviction
+    uint64_t hit_count;                // Usage statistics
+    uint64_t compile_time_ns;          // Compilation time tracking
+    struct vfm_jit_cache_entry *next;  // Hash table collision chain
+} VFM_CACHE_ALIGNED vfm_jit_cache_entry_t;
+
+typedef struct vfm_jit_cache_stats {
+    uint64_t cache_hits;               // Successful cache lookups
+    uint64_t cache_misses;             // Failed cache lookups
+    uint64_t total_compilations;       // Total JIT compilations performed
+    uint64_t memory_used;              // Current memory usage
+    uint64_t memory_peak;              // Peak memory usage
+    uint64_t evictions;                // Cache evictions performed
+    double avg_compile_time_ms;        // Average compilation time
+    double cache_hit_ratio;            // Hit ratio percentage
+    uint32_t active_entries;           // Current cache entries
+    uint32_t _pad;                     // Padding
+} vfm_jit_cache_stats_t;
+
+typedef struct vfm_jit_cache_config {
+    uint32_t max_entries;              // Maximum cache entries
+    size_t max_memory_mb;              // Memory limit in MB
+    uint32_t bucket_count;             // Hash table size
+    bool enable_stats;                 // Enable statistics collection
+    bool enable_prefetch;              // Enable prefetching
+    uint32_t eviction_batch_size;      // LRU eviction batch size
+    uint8_t _pad[3];                   // Padding
+} vfm_jit_cache_config_t;
 
 // BPF compilation targets
 typedef struct bpf_insn {
@@ -307,6 +558,17 @@ typedef struct vfm_batch {
 vfm_state_t* vfm_create(void);
 void vfm_destroy(vfm_state_t *vm);
 
+// Phase 3.1: Multi-core VFM API
+vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores);
+void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm);
+int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *program, uint32_t len);
+int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch);
+void vfm_multicore_get_stats(const vfm_multicore_state_t *mc_vm, vfm_stats_t *stats);
+
+// Core affinity and NUMA functions
+int vfm_multicore_set_thread_affinity(vfm_multicore_state_t *mc_vm, bool enable);
+int vfm_multicore_set_numa_node(vfm_multicore_state_t *mc_vm, uint32_t numa_node);
+
 // Load program
 int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len);
 
@@ -337,6 +599,36 @@ uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
 bool vfm_jit_available_arm64(void);
 
+// Phase 3.2.3: Adaptive JIT compilation with profile-guided optimization
+void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len, 
+                                     vfm_execution_profile_t *profile);
+void* vfm_jit_compile_x86_64_adaptive(const uint8_t *program, uint32_t len, 
+                                      vfm_execution_profile_t *profile);
+
+// JIT Cache Management
+int vfm_jit_cache_init(const vfm_jit_cache_config_t *config);
+void vfm_jit_cache_destroy(void);
+int vfm_jit_cache_configure(const vfm_jit_cache_config_t *config);
+
+// Program Hash Functions
+vfm_program_hash_t vfm_compute_program_hash(const uint8_t *program, uint32_t len);
+bool vfm_program_hash_equal(const vfm_program_hash_t *a, const vfm_program_hash_t *b);
+
+// Cache Operations
+vfm_jit_cache_entry_t* vfm_jit_cache_lookup(const vfm_program_hash_t *hash);
+vfm_jit_cache_entry_t* vfm_jit_cache_store(const vfm_program_hash_t *hash, 
+                                           void *jit_code, size_t code_size);
+void vfm_jit_cache_release(vfm_jit_cache_entry_t *entry);
+
+// Cache Statistics and Monitoring
+void vfm_jit_cache_get_stats(vfm_jit_cache_stats_t *stats);
+void vfm_jit_cache_reset_stats(void);
+void vfm_jit_cache_print_stats(void);
+
+// JIT Cache Internal Functions (implementation only)
+void vfm_jit_cache_evict_lru(size_t bytes_needed);
+void vfm_jit_cache_update_lru(vfm_jit_cache_entry_t *entry);
+
 // Platform-specific optimizations
 void vfm_enable_optimizations(vfm_state_t *vm);
 
@@ -347,6 +639,11 @@ void vfm_reset_stats(vfm_state_t *vm);
 // Flow table operations
 int vfm_flow_table_init(vfm_state_t *vm, uint32_t size);
 void vfm_flow_table_destroy(vfm_state_t *vm);
+void vfm_flow_table_get_stats(const vfm_state_t *vm, vfm_flow_stats_t *stats);
+
+// Hash functions for testing (cross-platform optimized)
+uint64_t vfm_hash_ipv4_5tuple(const uint8_t *packet, uint16_t len);
+uint64_t vfm_hash_ipv6_5tuple(const uint8_t *packet, uint16_t len);
 void vfm_flow_table_clear(vfm_state_t *vm);
 
 // Utility functions
@@ -433,7 +730,10 @@ static const char *vfm_opcode_names[] = {
     [VFM_JLE128]     = "JLE128",
     [VFM_IP_VER]     = "IP_VER",
     [VFM_IPV6_EXT]   = "IPV6_EXT",
-    [VFM_HASH6]      = "HASH6"
+    [VFM_HASH6]      = "HASH6",
+    [VFM_BULK_LOAD128]   = "BULK_LOAD128",
+    [VFM_PARALLEL_EQ128] = "PARALLEL_EQ128", 
+    [VFM_STACK_PREFETCH] = "STACK_PREFETCH"
 };
 
 // Opcode format information
