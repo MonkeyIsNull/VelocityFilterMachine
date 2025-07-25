@@ -4,10 +4,14 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 // Platform-specific includes
 #ifdef VFM_PLATFORM_MACOS
     #include <mach/mach.h>
+    #include <sys/sysctl.h>
+    #include <mach/thread_policy.h>
+    #include <mach/thread_act.h>
     #include <mach/vm_map.h>
     #include <mach/mach_time.h>
 #else
@@ -1471,4 +1475,494 @@ static uint64_t get_timestamp_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 #endif
+}
+
+// ============================================================================
+// Phase 3.1.2: Lock-free flow table operations for multi-threaded access
+// ============================================================================
+
+// Atomic flow table lookup with lock-free access
+static VFM_ALWAYS_INLINE uint64_t flow_table_get_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key) {
+    if (VFM_UNLIKELY(!flow_table)) return 0;
+    
+    uint32_t index = key & flow_table_mask;
+    vfm_flow_entry_t *entry = &flow_table[index];
+    
+    // Linear probing with atomic reads (max 4 probes for cache efficiency)
+    for (int probe = 0; probe <= 4; probe++) {
+        uint32_t probe_index = (index + probe) & flow_table_mask;
+        vfm_flow_entry_t *probe_entry = &flow_table[probe_index];
+        
+        // Atomic read of the key
+        uint64_t entry_key = atomic_load_explicit(&probe_entry->key, memory_order_acquire);
+        
+        if (entry_key == key && entry_key != 0) {
+            // Found matching entry - update last_seen atomically
+            uint64_t current_time = vfm_get_time();
+            atomic_store_explicit(&probe_entry->last_seen, current_time, memory_order_relaxed);
+            
+            // Atomic read of value
+            return atomic_load_explicit(&probe_entry->value, memory_order_acquire);
+        }
+        
+        // Stop probing if we hit an empty slot
+        if (entry_key == 0) break;
+    }
+    
+    return 0; // Not found
+}
+
+// Atomic flow table insertion with lock-free access using compare-and-swap
+static VFM_ALWAYS_INLINE bool flow_table_set_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key, uint64_t value) {
+    if (VFM_UNLIKELY(!flow_table)) return false;
+    
+    uint32_t index = key & flow_table_mask;
+    uint64_t current_time = vfm_get_time();
+    
+    // Linear probing to find insertion point
+    for (int probe = 0; probe <= 4; probe++) {
+        uint32_t probe_index = (index + probe) & flow_table_mask;
+        vfm_flow_entry_t *entry = &flow_table[probe_index];
+        
+        // Try to read current key
+        uint64_t entry_key = atomic_load_explicit(&entry->key, memory_order_acquire);
+        
+        if (entry_key == key && entry_key != 0) {
+            // Update existing entry atomically
+            atomic_store_explicit(&entry->value, value, memory_order_release);
+            atomic_store_explicit(&entry->last_seen, current_time, memory_order_relaxed);
+            return true;
+        }
+        
+        if (entry_key == 0) {
+            // Try to claim this empty slot with compare-and-swap
+            uint64_t expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&entry->key, &expected, key, 
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+                // Successfully claimed the slot, now set the value
+                atomic_store_explicit(&entry->value, value, memory_order_release);
+                atomic_store_explicit(&entry->last_seen, current_time, memory_order_relaxed);
+                atomic_store_explicit(&entry->collision_count, probe, memory_order_relaxed);
+                return true;
+            }
+            // If CAS failed, someone else claimed this slot, continue probing
+        }
+    }
+    
+    // No available slot found in probe range - could implement LRU eviction here
+    return false;
+}
+
+// ============================================================================
+// Phase 3.1: Multi-core VFM Implementation
+// ============================================================================
+
+// Helper function to get number of available CPU cores
+static uint32_t get_cpu_count(void) {
+#ifdef VFM_PLATFORM_MACOS
+    int ncpu;
+    size_t len = sizeof(ncpu);
+    if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0) {
+        return (uint32_t)ncpu;
+    }
+#else
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0) {
+        return (uint32_t)ncpu;
+    }
+#endif
+    return 1; // Fallback to single core
+}
+
+// Worker thread function for multi-core execution
+typedef struct worker_context {
+    vfm_multicore_state_t *mc_vm;
+    vfm_core_context_t *core_ctx;
+    uint32_t thread_id;
+    volatile bool *shutdown;
+    
+    // Work queue for this thread
+    const uint8_t **packets;
+    uint16_t *packet_lengths;
+    uint8_t *results;
+    uint32_t start_idx;
+    uint32_t end_idx;
+    
+    // Synchronization
+    pthread_mutex_t *work_mutex;
+    pthread_cond_t *work_cond;
+    volatile bool work_ready;
+    
+} worker_context_t;
+
+static void* worker_thread(void *arg) {
+    worker_context_t *ctx = (worker_context_t*)arg;
+    vfm_core_context_t *core = ctx->core_ctx;
+    vfm_shared_context_t *shared = ctx->mc_vm->shared;
+    
+    while (!*ctx->shutdown) {
+        // Wait for work
+        pthread_mutex_lock(ctx->work_mutex);
+        while (!ctx->work_ready && !*ctx->shutdown) {
+            pthread_cond_wait(ctx->work_cond, ctx->work_mutex);
+        }
+        pthread_mutex_unlock(ctx->work_mutex);
+        
+        if (*ctx->shutdown) break;
+        
+        // Process assigned packet range
+        for (uint32_t i = ctx->start_idx; i < ctx->end_idx; i++) {
+            core->packet = ctx->packets[i];
+            core->hot.packet_len = ctx->packet_lengths[i];
+            
+            // Reset execution state for each packet
+            core->hot.pc = 0;
+            core->hot.sp = 0;
+            core->hot.insn_count = 0;
+            core->hot.error = VFM_SUCCESS;
+            
+            // Example of lock-free flow table access during execution
+            // In real implementation, this would be integrated into VFM opcodes
+            if (ctx->mc_vm->flow_table) {
+                // Create a simple flow key from packet data (simplified)
+                uint64_t flow_key = 0;
+                if (core->hot.packet_len >= 20) {
+                    // Use first 8 bytes of packet as flow key (simplified)
+                    flow_key = *(uint64_t*)core->packet;
+                }
+                
+                // Lock-free flow table lookup
+                uint64_t flow_value = flow_table_get_lockfree(ctx->mc_vm->flow_table, 
+                                                            ctx->mc_vm->flow_table_mask, 
+                                                            flow_key);
+                
+                // Update flow statistics (per-core, no locks needed)
+                core->flow_stats.lookups++;
+                if (flow_value != 0) {
+                    core->flow_stats.hits++;
+                } else {
+                    core->flow_stats.misses++;
+                    
+                    // Try to insert new flow entry (lock-free)
+                    uint64_t new_value = i + 1; // Simplified value
+                    if (flow_table_set_lockfree(ctx->mc_vm->flow_table, 
+                                               ctx->mc_vm->flow_table_mask, 
+                                               flow_key, new_value)) {
+                        // Successfully inserted
+                    }
+                }
+            }
+            
+            // Execute filter (using existing vfm_execute logic)
+            // For now, simplified execution - would use actual VFM interpreter
+            int result = 1; // Placeholder: would call actual VFM execution
+            
+            ctx->results[i] = (uint8_t)result;
+            core->hot.insn_count++;
+        }
+        
+        // Mark work as completed
+        ctx->work_ready = false;
+    }
+    
+    return NULL;
+}
+
+// Phase 3.1.1: Create multi-core VFM state with per-core isolation
+vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
+    if (num_cores == 0 || num_cores > 16) {
+        num_cores = get_cpu_count();
+        if (num_cores > 16) num_cores = 16; // Limit to max 16 cores
+    }
+    
+    vfm_multicore_state_t *mc_vm = calloc(1, sizeof(vfm_multicore_state_t));
+    if (!mc_vm) return NULL;
+    
+    // Initialize shared context
+    mc_vm->shared = calloc(1, sizeof(vfm_shared_context_t));
+    if (!mc_vm->shared) {
+        free(mc_vm);
+        return NULL;
+    }
+    
+    // Configure multi-core setup
+    mc_vm->num_cores = num_cores;
+    mc_vm->active_cores = 0;
+    mc_vm->shutdown = false;
+    
+    // Initialize shared context
+    mc_vm->shared->num_cores = num_cores;
+    mc_vm->shared->numa_node = 0; // Default NUMA node
+    mc_vm->shared->jit_enabled = true;
+    
+    // Set platform-specific hints
+    #ifdef VFM_APPLE_SILICON
+        mc_vm->shared->hints.use_prefetch = true;
+        mc_vm->shared->hints.prefetch_distance = 2;
+        mc_vm->shared->hints.use_huge_pages = true;
+    #else
+        mc_vm->shared->hints.use_prefetch = true;
+        mc_vm->shared->hints.prefetch_distance = 1;
+        mc_vm->shared->hints.use_huge_pages = false;
+    #endif
+    
+    // Allocate per-core contexts with cache line alignment
+    mc_vm->cores = calloc(num_cores, sizeof(vfm_core_context_t*));
+    if (!mc_vm->cores) {
+        free(mc_vm->shared);
+        free(mc_vm);
+        return NULL;
+    }
+    
+    // Initialize each core context with isolation
+    for (uint32_t i = 0; i < num_cores; i++) {
+        mc_vm->cores[i] = aligned_alloc(VFM_CACHE_LINE_SIZE, sizeof(vfm_core_context_t));
+        if (!mc_vm->cores[i]) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j < i; j++) {
+                if (mc_vm->cores[j]->stack) free(mc_vm->cores[j]->stack);
+                free(mc_vm->cores[j]);
+            }
+            free(mc_vm->cores);
+            free(mc_vm->shared);
+            free(mc_vm);
+            return NULL;
+        }
+        
+        memset(mc_vm->cores[i], 0, sizeof(vfm_core_context_t));
+        
+        // Initialize per-core stack (isolated to prevent false sharing)
+        mc_vm->cores[i]->stack_size = VFM_STACK_SIZE;
+        mc_vm->cores[i]->stack = aligned_alloc(128, VFM_STACK_SIZE * sizeof(uint64_t));
+        if (!mc_vm->cores[i]->stack) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j <= i; j++) {
+                if (mc_vm->cores[j] && mc_vm->cores[j]->stack) free(mc_vm->cores[j]->stack);
+                if (mc_vm->cores[j]) free(mc_vm->cores[j]);
+            }
+            free(mc_vm->cores);
+            free(mc_vm->shared);
+            free(mc_vm);
+            return NULL;
+        }
+        
+        mc_vm->cores[i]->core_id = i;
+        memset(&mc_vm->cores[i]->flow_stats, 0, sizeof(vfm_flow_stats_t));
+    }
+    
+    // Allocate thread handles
+    mc_vm->threads = calloc(num_cores, sizeof(pthread_t));
+    if (!mc_vm->threads) {
+        vfm_multicore_destroy(mc_vm);
+        return NULL;
+    }
+    
+    // Initialize shared lock-free flow table
+    uint32_t flow_table_size = 1024; // Default size, can be configured
+    #ifdef VFM_APPLE_SILICON
+        // Optimize for 128-byte cache lines
+        uint32_t entries_per_cache_line = 128 / sizeof(vfm_flow_entry_t);
+        flow_table_size = ((flow_table_size + entries_per_cache_line - 1) / entries_per_cache_line) * entries_per_cache_line;
+    #endif
+    
+    // Round up to power of 2
+    flow_table_size--;
+    flow_table_size |= flow_table_size >> 1;
+    flow_table_size |= flow_table_size >> 2;
+    flow_table_size |= flow_table_size >> 4;
+    flow_table_size |= flow_table_size >> 8;
+    flow_table_size |= flow_table_size >> 16;
+    flow_table_size++;
+    
+    size_t table_size = flow_table_size * sizeof(vfm_flow_entry_t);
+    
+    #ifdef VFM_PLATFORM_MACOS
+        mc_vm->flow_table = mmap(NULL, table_size, PROT_READ | PROT_WRITE, 
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mc_vm->flow_table == MAP_FAILED) {
+            mc_vm->flow_table = NULL;
+        }
+    #else
+        mc_vm->flow_table = aligned_alloc(VFM_CACHE_LINE_SIZE, table_size);
+    #endif
+    
+    if (mc_vm->flow_table) {
+        memset(mc_vm->flow_table, 0, table_size);
+        mc_vm->flow_table_mask = flow_table_size - 1;
+    }
+    
+    return mc_vm;
+}
+
+// Destroy multi-core VFM state
+void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm) {
+    if (!mc_vm) return;
+    
+    // Signal shutdown to all threads
+    mc_vm->shutdown = true;
+    
+    // Wait for all threads to complete
+    if (mc_vm->threads) {
+        for (uint32_t i = 0; i < mc_vm->active_cores; i++) {
+            pthread_join(mc_vm->threads[i], NULL);
+        }
+        free(mc_vm->threads);
+    }
+    
+    // Cleanup per-core contexts
+    if (mc_vm->cores) {
+        for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+            if (mc_vm->cores[i]) {
+                if (mc_vm->cores[i]->stack) {
+                    free(mc_vm->cores[i]->stack);
+                }
+                free(mc_vm->cores[i]);
+            }
+        }
+        free(mc_vm->cores);
+    }
+    
+    // Cleanup shared flow table
+    if (mc_vm->flow_table) {
+        size_t table_size = (mc_vm->flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
+        #ifdef VFM_PLATFORM_MACOS
+            munmap(mc_vm->flow_table, table_size);
+        #else
+            free(mc_vm->flow_table);
+        #endif
+    }
+    
+    // Cleanup shared context
+    if (mc_vm->shared) {
+        if (mc_vm->shared->jit_code) {
+            vfm_jit_free(mc_vm->shared->jit_code, mc_vm->shared->jit_code_size);
+        }
+        free(mc_vm->shared);
+    }
+    
+    free(mc_vm);
+}
+
+// Load program into multi-core VFM
+int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *program, uint32_t len) {
+    if (!mc_vm || !program || len == 0) {
+        return VFM_ERROR_INVALID_PROGRAM;
+    }
+    
+    // Store program in shared context (read-only across all cores)
+    mc_vm->shared->program = program;
+    mc_vm->shared->program_len = len;
+    
+    // Compile JIT code once for all cores
+    if (mc_vm->shared->jit_enabled) {
+        #ifdef __aarch64__
+            mc_vm->shared->jit_code = vfm_jit_compile_arm64(program, len);
+        #elif defined(__x86_64__)
+            mc_vm->shared->jit_code = vfm_jit_compile_x86_64(program, len);
+        #endif
+        
+        if (mc_vm->shared->jit_code) {
+            mc_vm->shared->jit_code_size = len * 32; // Estimated size
+        }
+    }
+    
+    return VFM_SUCCESS;
+}
+
+// Execute batch of packets across multiple cores
+int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch) {
+    if (!mc_vm || !batch || batch->count == 0) {
+        return VFM_ERROR_INVALID_PROGRAM;
+    }
+    
+    uint32_t packets_per_core = batch->count / mc_vm->num_cores;
+    uint32_t remaining_packets = batch->count % mc_vm->num_cores;
+    
+    // Allocate worker contexts
+    worker_context_t *workers = calloc(mc_vm->num_cores, sizeof(worker_context_t));
+    if (!workers) return VFM_ERROR_NO_MEMORY;
+    
+    pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t work_cond = PTHREAD_COND_INITIALIZER;
+    
+    // Distribute work across cores
+    uint32_t current_packet = 0;
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        workers[i].mc_vm = mc_vm;
+        workers[i].core_ctx = mc_vm->cores[i];
+        workers[i].thread_id = i;
+        workers[i].shutdown = &mc_vm->shutdown;
+        
+        workers[i].packets = batch->packets;
+        workers[i].packet_lengths = batch->lengths;
+        workers[i].results = batch->results;
+        workers[i].start_idx = current_packet;
+        
+        uint32_t packets_for_this_core = packets_per_core;
+        if (i < remaining_packets) packets_for_this_core++; // Distribute remainder
+        
+        workers[i].end_idx = current_packet + packets_for_this_core;
+        current_packet = workers[i].end_idx;
+        
+        workers[i].work_mutex = &work_mutex;
+        workers[i].work_cond = &work_cond;
+        workers[i].work_ready = true;
+        
+        // Create thread
+        if (pthread_create(&mc_vm->threads[i], NULL, worker_thread, &workers[i]) != 0) {
+            // Cleanup on thread creation failure
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_cancel(mc_vm->threads[j]);
+                pthread_join(mc_vm->threads[j], NULL);
+            }
+            free(workers);
+            return VFM_ERROR_NO_MEMORY;
+        }
+    }
+    
+    mc_vm->active_cores = mc_vm->num_cores;
+    
+    // Signal all threads to start work
+    pthread_mutex_lock(&work_mutex);
+    pthread_cond_broadcast(&work_cond);
+    pthread_mutex_unlock(&work_mutex);
+    
+    // Wait for all threads to complete
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        pthread_join(mc_vm->threads[i], NULL);
+    }
+    
+    mc_vm->active_cores = 0;
+    
+    // Update global statistics
+    mc_vm->global_stats.total_packets += batch->count;
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        mc_vm->global_stats.total_instructions += mc_vm->cores[i]->hot.insn_count;
+        mc_vm->global_stats.core_utilization[i]++;
+    }
+    
+    free(workers);
+    return VFM_SUCCESS;
+}
+
+// Get aggregated statistics from all cores
+void vfm_multicore_get_stats(const vfm_multicore_state_t *mc_vm, vfm_stats_t *stats) {
+    if (!mc_vm || !stats) return;
+    
+    memset(stats, 0, sizeof(vfm_stats_t));
+    
+    // Aggregate statistics from all cores
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        vfm_core_context_t *core = mc_vm->cores[i];
+        stats->packets_processed += 1; // Would track actual packets per core
+        stats->instructions_executed += core->hot.insn_count;
+        
+        // Aggregate flow table stats
+        stats->flow_hits += core->flow_stats.hits;
+        stats->flow_misses += core->flow_stats.misses;
+    }
+    
+    stats->total_execution_time_ns = get_timestamp_ns(); // Would track actual execution time
+    stats->avg_instructions_per_packet = stats->packets_processed > 0 ? 
+        (double)stats->instructions_executed / stats->packets_processed : 0.0;
 }

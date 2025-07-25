@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -185,16 +186,101 @@ typedef struct vfm_flow_stats {
     double hit_rate;        // Cache hit rate (0.0-1.0)
 } vfm_flow_stats_t;
 
-// Flow table entry - Phase 2.3 cache-optimized layout
+// Phase 3.1: Multi-core VFM architecture
+typedef struct vfm_core_context {
+    // Core-local execution state - must be isolated per thread
+    struct {
+        uint32_t pc;                // Program counter
+        uint32_t insn_count;        // Instructions executed
+        uint32_t insn_limit;        // Instruction limit
+        vfm_error_t error;          // Execution error state
+        uint32_t sp;                // Stack pointer
+        uint16_t packet_len;        // Current packet length
+        uint16_t _pad1;             // Padding
+    } VFM_CACHE_ALIGNED hot;
+    
+    // Core-local packet data
+    const uint8_t *packet;          // Current packet being processed
+    
+    // Per-core stack - isolated to prevent false sharing
+    uint64_t *stack VFM_ALIGNED(128);  // Aligned to cache line
+    uint32_t stack_size;
+    uint32_t core_id;               // Core identifier
+    
+    // Per-core registers - isolated per thread
+    uint64_t regs[16] VFM_CACHE_ALIGNED;
+    
+    // Core-local flow statistics
+    vfm_flow_stats_t flow_stats VFM_CACHE_ALIGNED;
+    
+} VFM_CACHE_ALIGNED vfm_core_context_t;
+
+// Shared read-only data across all cores
+typedef struct vfm_shared_context {
+    // Program data (read-only, shared across cores)
+    const uint8_t *program;
+    uint32_t program_len;
+    uint32_t _pad1;
+    
+    // Shared JIT cache (thread-safe access)
+    void *jit_code;
+    size_t jit_code_size;
+    bool jit_enabled;
+    struct vfm_jit_cache_entry *jit_cache_entry;
+    
+    // Platform hints (read-only after initialization)
+    struct {
+        bool use_prefetch;
+        bool use_huge_pages;
+        uint8_t prefetch_distance;
+        uint8_t _pad[5];
+    } hints;
+    
+    // Multi-core configuration
+    uint32_t num_cores;             // Number of cores to use
+    uint32_t numa_node;             // NUMA node for memory allocation
+    
+} VFM_CACHE_ALIGNED vfm_shared_context_t;
+
+// Phase 3.1.2: Lock-free flow table entry with atomic operations
 typedef struct vfm_flow_entry {
-    uint64_t key;           // Hash key (most frequently accessed)
-    uint64_t value;         // Associated value
-    uint64_t last_seen;     // Timestamp for LRU eviction
-    uint32_t collision_count; // Number of collisions for this slot
-    uint32_t _pad;          // Padding to 32-byte alignment
+    _Atomic(uint64_t) key;           // Hash key (atomic for lock-free access)
+    _Atomic(uint64_t) value;         // Associated value (atomic)
+    _Atomic(uint64_t) last_seen;     // Timestamp for LRU eviction (atomic)
+    _Atomic(uint32_t) collision_count; // Number of collisions for this slot (atomic)
+    uint32_t _pad;                   // Padding to 32-byte alignment
 } VFM_CACHE_ALIGNED vfm_flow_entry_t;
 
-// VM state structure - optimized for cache locality
+// Phase 3.1: Multi-core VFM state structure
+typedef struct vfm_multicore_state {
+    // Shared context (read-only after initialization)
+    vfm_shared_context_t *shared;
+    
+    // Per-core contexts (one per thread)
+    vfm_core_context_t **cores;
+    
+    // Shared flow table (thread-safe access required)
+    vfm_flow_entry_t *flow_table;
+    uint32_t flow_table_mask;
+    
+    // Multi-threading configuration
+    uint32_t num_cores;
+    uint32_t active_cores;          // Currently active cores
+    
+    // Thread management
+    pthread_t *threads;             // Worker threads
+    volatile bool shutdown;         // Shutdown signal
+    
+    // Performance monitoring across all cores
+    struct {
+        uint64_t total_packets;     // Total packets processed
+        uint64_t total_instructions; // Total instructions executed
+        uint64_t core_utilization[16]; // Per-core utilization (max 16 cores)
+    } global_stats;
+    
+} VFM_CACHE_ALIGNED vfm_multicore_state_t;
+
+// Legacy single-core VM state structure - optimized for cache locality
 typedef struct vfm_state {
     // Hot data - frequently accessed during execution
     struct {
@@ -384,6 +470,17 @@ typedef struct vfm_batch {
 // Initialize VM state
 vfm_state_t* vfm_create(void);
 void vfm_destroy(vfm_state_t *vm);
+
+// Phase 3.1: Multi-core VFM API
+vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores);
+void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm);
+int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *program, uint32_t len);
+int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch);
+void vfm_multicore_get_stats(const vfm_multicore_state_t *mc_vm, vfm_stats_t *stats);
+
+// Core affinity and NUMA functions
+int vfm_multicore_set_thread_affinity(vfm_multicore_state_t *mc_vm, bool enable);
+int vfm_multicore_set_numa_node(vfm_multicore_state_t *mc_vm, uint32_t numa_node);
 
 // Load program
 int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len);
