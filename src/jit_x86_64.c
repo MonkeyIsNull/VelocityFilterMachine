@@ -141,7 +141,7 @@ static void emit_byte(x86_64_jit_t *jit, uint8_t byte) {
     jit->code[jit->code_pos++] = byte;
 }
 
-static void emit_word(x86_64_jit_t *jit, uint16_t word) {
+static void __attribute__((unused)) emit_word(x86_64_jit_t *jit, uint16_t word) {
     emit_byte(jit, word & 0xFF);
     emit_byte(jit, (word >> 8) & 0xFF);
 }
@@ -686,7 +686,7 @@ static void emit_vpxor_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t
 }
 
 // VPAND YMM, YMM, YMM - bitwise AND
-static void emit_vpand_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
+static void __attribute__((unused)) emit_vpand_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
     // VEX.NDS.256.66.0F.WIG DB /r
     uint8_t rxb = 0xE0 | (1 << 2);  // RXB bits + map_select (0F)
     uint8_t w_vvvv_l_pp = 0x40 | ((~src1 & 0xF) << 3) | 0x01;  // W=0, vvvv=~src1, L=1, pp=01 (66)
@@ -697,7 +697,7 @@ static void emit_vpand_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t
 }
 
 // VPOR YMM, YMM, YMM - bitwise OR
-static void emit_vpor_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
+static void __attribute__((unused)) emit_vpor_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t src2) {
     // VEX.NDS.256.66.0F.WIG EB /r
     uint8_t rxb = 0xE0 | (1 << 2);  // RXB bits + map_select (0F)
     uint8_t w_vvvv_l_pp = 0x40 | ((~src1 & 0xF) << 3) | 0x01;  // W=0, vvvv=~src1, L=1, pp=01 (66)
@@ -708,7 +708,7 @@ static void emit_vpor_ymm(x86_64_jit_t *jit, uint8_t dst, uint8_t src1, uint8_t 
 }
 
 // Optimized IPv6 hash function using AVX2 (Phase 2.2)
-static void emit_avx2_ipv6_hash(x86_64_jit_t *jit) {
+static void __attribute__((unused)) emit_avx2_ipv6_hash(x86_64_jit_t *jit) {
     // Load IPv6 address (128 bits) into YMM0 (lower 128 bits)
     // ymm0 = IPv6 source address (16 bytes)
     emit_vmovdqu_ymm_mem(jit, YMM0, RSI, 24);  // IPv6 src offset in packet
@@ -730,7 +730,7 @@ static void emit_avx2_ipv6_hash(x86_64_jit_t *jit) {
 }
 
 // Parallel processing for multiple 128-bit comparisons (Phase 2.2)
-static void emit_avx2_parallel_128bit_cmp(x86_64_jit_t *jit) {
+static void __attribute__((unused)) emit_avx2_parallel_128bit_cmp(x86_64_jit_t *jit) {
     // Load two 128-bit values into single YMM register (256 bits total)
     // This allows comparing 2 pairs simultaneously
     

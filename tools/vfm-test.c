@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
@@ -89,7 +91,7 @@ static int read_packet(FILE *file, uint8_t *buffer, uint16_t *packet_len) {
     // Little endian length
     *packet_len = len_bytes[0] | (len_bytes[1] << 8);
     
-    if (*packet_len == 0 || *packet_len > VFM_MAX_PACKET) {
+    if (*packet_len == 0) {
         fprintf(stderr, "Error: Invalid packet length: %u\n", *packet_len);
         return -1;
     }
@@ -254,17 +256,17 @@ static int test_filter(const char *filter_file, const char *packet_file, int ver
         if (result == 1) {
             stats.accepted_packets++;
             if (verbose) {
-                printf("Packet %llu: ACCEPT (%.1f ns)\n", stats.total_packets, elapsed);
+                printf("Packet %" PRIu64 ": ACCEPT (%.1f ns)\n", stats.total_packets, elapsed);
             }
         } else if (result == 0) {
             stats.dropped_packets++;
             if (verbose) {
-                printf("Packet %llu: DROP (%.1f ns)\n", stats.total_packets, elapsed);
+                printf("Packet %" PRIu64 ": DROP (%.1f ns)\n", stats.total_packets, elapsed);
             }
         } else {
             stats.error_packets++;
             if (verbose) {
-                printf("Packet %llu: ERROR %d (%.1f ns)\n", stats.total_packets, result, elapsed);
+                printf("Packet %" PRIu64 ": ERROR %d (%.1f ns)\n", stats.total_packets, result, elapsed);
             }
         }
     }
@@ -280,12 +282,12 @@ static int test_filter(const char *filter_file, const char *packet_file, int ver
     
     // Print summary statistics
     printf("\n=== Test Results ===\n");
-    printf("Total packets:    %llu\n", stats.total_packets);
-    printf("Accepted:         %llu (%.1f%%)\n", stats.accepted_packets, 
+    printf("Total packets:    %" PRIu64 "\n", stats.total_packets);
+    printf("Accepted:         %" PRIu64 " (%.1f%%)\n", stats.accepted_packets, 
            stats.total_packets > 0 ? 100.0 * stats.accepted_packets / stats.total_packets : 0.0);
-    printf("Dropped:          %llu (%.1f%%)\n", stats.dropped_packets,
+    printf("Dropped:          %" PRIu64 " (%.1f%%)\n", stats.dropped_packets,
            stats.total_packets > 0 ? 100.0 * stats.dropped_packets / stats.total_packets : 0.0);
-    printf("Errors:           %llu (%.1f%%)\n", stats.error_packets,
+    printf("Errors:           %" PRIu64 " (%.1f%%)\n", stats.error_packets,
            stats.total_packets > 0 ? 100.0 * stats.error_packets / stats.total_packets : 0.0);
     
     if (stats.total_packets > 0) {

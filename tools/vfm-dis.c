@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <getopt.h>
 #include "vfm.h"
@@ -155,9 +156,9 @@ static int disassemble_instruction(disassembler_t *dis, const uint8_t *program,
             }
             uint64_t value = read_u64_le(&program[*pc]);
             if (value <= 0xFFFFFFFF) {
-                fprintf(dis->output, " %llu", value);
+                fprintf(dis->output, " %" PRIu64, value);
             } else {
-                fprintf(dis->output, " 0x%llx", value);
+                fprintf(dis->output, " 0x%" PRIx64, value);
             }
             *pc += 8;
             break;
