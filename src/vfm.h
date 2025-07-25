@@ -132,6 +132,11 @@ enum vfm_opcode {
     VFM_IP_VER,  // Get IP version (4 or 6)
     VFM_IPV6_EXT,// Extract IPv6 extension header field
     VFM_HASH6,   // Hash IPv6 5-tuple
+
+    // ARM64 NEON optimized operations for Phase 2.1.3
+    VFM_BULK_LOAD128,    // Bulk load multiple 128-bit values using NEON LDP
+    VFM_PARALLEL_EQ128,  // Parallel comparison of multiple 128-bit pairs
+    VFM_STACK_PREFETCH,  // Prefetch stack regions for cache optimization
     
     VFM_OPCODE_MAX
 };
@@ -207,7 +212,10 @@ static const char *vfm_opcode_names[] = {
     [VFM_JLE128]     = "JLE128",
     [VFM_HASH6]      = "HASH6",
     [VFM_IP_VER]     = "IP_VER",
-    [VFM_IPV6_EXT]   = "IPV6_EXT"
+    [VFM_IPV6_EXT]   = "IPV6_EXT",
+    [VFM_BULK_LOAD128]   = "BULK_LOAD128",
+    [VFM_PARALLEL_EQ128] = "PARALLEL_EQ128",
+    [VFM_STACK_PREFETCH] = "STACK_PREFETCH"
 };
 
 // Opcode format information
@@ -270,7 +278,10 @@ static const vfm_format_t vfm_opcode_format[] = {
     [VFM_JLE128]     = VFM_FMT_OFFSET16,
     [VFM_HASH6]      = VFM_FMT_NONE,     // computes IPv6 5-tuple hash
     [VFM_IP_VER]     = VFM_FMT_NONE,     // pushes IP version (4 or 6)
-    [VFM_IPV6_EXT]   = VFM_FMT_IMM8      // extracts IPv6 extension header field (field type as immediate)
+    [VFM_IPV6_EXT]   = VFM_FMT_IMM8,     // extracts IPv6 extension header field (field type as immediate)
+    [VFM_BULK_LOAD128]   = (VFM_FMT_IMM8 | (VFM_FMT_IMM16 << 8)), // count + offset (custom format)
+    [VFM_PARALLEL_EQ128] = VFM_FMT_IMM8, // number of pairs to compare
+    [VFM_STACK_PREFETCH] = VFM_FMT_IMM8  // prefetch depth
 };
 
 // Get instruction size in bytes

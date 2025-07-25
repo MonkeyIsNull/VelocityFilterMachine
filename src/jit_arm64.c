@@ -140,6 +140,113 @@ static void emit_addp_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
     emit_u32(jit, insn);
 }
 
+// Emit ADDV to efficiently reduce vector to scalar (single instruction)
+static void emit_addv_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
+    // ADDV Bd, Vn.16B - sum all 16 bytes to single byte in Bd
+    uint32_t insn = 0x4e31b800 | (vn << 5) | vd;
+    emit_u32(jit, insn);
+}
+
+// Emit scaled load for 128-bit stack access (single instruction)
+static void emit_ldr_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
+    // LDR Qd, [Xbase, Xindex, LSL #4] - load with scaled index
+    uint32_t insn = 0x3cc00000 | (1 << 12) | (index << 16) | (base << 5) | qt;
+    emit_u32(jit, insn);
+}
+
+// Emit scaled store for 128-bit stack access (single instruction)
+static void emit_str_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
+    // STR Qd, [Xbase, Xindex, LSL #4] - store with scaled index
+    uint32_t insn = 0x3c800000 | (1 << 12) | (index << 16) | (base << 5) | qt;
+    emit_u32(jit, insn);
+}
+
+// Emit prefetch instruction for memory optimization
+static void emit_prfm(vfm_jit_arm64_t *jit, int type, int rn, int offset) {
+    // PRFM type, [Xn, #offset] - prefetch memory
+    // Type: 0=PLDL1KEEP, 1=PLDL1STRM, 2=PLDL2KEEP, 3=PLDL2STRM
+    uint32_t insn = 0xf9800000 | (type << 0) | ((offset >> 3) << 10) | (rn << 5);
+    emit_u32(jit, insn);
+}
+
+// NEON parallel load/store operations for optimized stack bandwidth
+
+// Emit LDP for Q-registers (load pair of 128-bit values)
+static void emit_ldp_q(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
+    // LDP Qd1, Qd2, [Xn, #imm] - Load pair of 128-bit values
+    // Allows loading 2x128 = 256 bits in a single instruction
+    // imm must be multiple of 32 bytes (range: -1024 to +1008)
+    uint32_t insn = 0xad400000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
+    emit_u32(jit, insn);
+}
+
+// Emit STP for Q-registers (store pair of 128-bit values)
+static void emit_stp_q(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
+    // STP Qd1, Qd2, [Xn, #imm] - Store pair of 128-bit values
+    // Allows storing 2x128 = 256 bits in a single instruction
+    // imm must be multiple of 32 bytes (range: -1024 to +1008)
+    uint32_t insn = 0xad000000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
+    emit_u32(jit, insn);
+}
+
+// Emit LDP with post-increment for Q-registers
+static void emit_ldp_q_post(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
+    // LDP Qd1, Qd2, [Xn], #imm - Load pair with post-increment
+    // Useful for streaming operations through stack regions
+    uint32_t insn = 0xacc00000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
+    emit_u32(jit, insn);
+}
+
+// Emit STP with pre-decrement for Q-registers
+static void emit_stp_q_pre(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) {
+    // STP Qd1, Qd2, [Xn, #imm]! - Store pair with pre-decrement
+    // Useful for pushing multiple values to stack efficiently
+    uint32_t insn = 0xad800000 | ((imm >> 4) << 15) | (qt2 << 10) | (rn << 5) | qt1;
+    emit_u32(jit, insn);
+}
+
+// Optimized bulk stack operations using NEON parallelism
+
+// Bulk load multiple 128-bit values from stack (2 at a time for better bandwidth)
+static void emit_bulk_stack128_load(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
+    // Load 'count' 128-bit values using LDP instructions for optimal memory bandwidth
+    // Uses Q0-Q7 as temporary registers
+    int pairs = count / 2;
+    int remainder = count % 2;
+    
+    for (int i = 0; i < pairs; i++) {
+        int q1 = (i * 2) % 8;     // Cycle through Q0-Q7
+        int q2 = (i * 2 + 1) % 8;
+        emit_ldp_q(jit, q1, q2, base_reg, offset + i * 32);
+    }
+    
+    // Handle odd count with single LDR
+    if (remainder) {
+        int q_reg = (pairs * 2) % 8;
+        emit_ldr_q_imm(jit, q_reg, base_reg, offset + pairs * 32);
+    }
+}
+
+// Bulk store multiple 128-bit values to stack (2 at a time for better bandwidth)
+static void emit_bulk_stack128_store(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
+    // Store 'count' 128-bit values using STP instructions for optimal memory bandwidth
+    // Uses Q0-Q7 as source registers
+    int pairs = count / 2;
+    int remainder = count % 2;
+    
+    for (int i = 0; i < pairs; i++) {
+        int q1 = (i * 2) % 8;     // Cycle through Q0-Q7
+        int q2 = (i * 2 + 1) % 8;
+        emit_stp_q(jit, q1, q2, base_reg, offset + i * 32);
+    }
+    
+    // Handle odd count with single STR
+    if (remainder) {
+        int q_reg = (pairs * 2) % 8;
+        emit_str_q_imm(jit, q_reg, base_reg, offset + pairs * 32);
+    }
+}
+
 // Emit function prologue
 static void emit_prologue(vfm_jit_arm64_t *jit) {
     // stp x29, x30, [sp, #-16]!
@@ -267,59 +374,138 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
             }
             
             case VFM_LD128: {
-                // Load 128-bit value from packet (IPv6 address)
+                // Optimized 128-bit load from packet (IPv6 address) with prefetching
                 uint16_t offset = *(uint16_t*)&program[pc];
                 pc += 2;
                 
-                // Bounds check: if offset + 16 > packet_len, return 0
+                // Calculate packet address with bounds check
                 emit_mov_imm(&jit, ARM64_X3, offset);             // Load offset into X3
                 emit_add_reg(&jit, ARM64_X3, ARM64_X1, ARM64_X3); // packet + offset  
-                // For now, assume bounds checking is handled elsewhere
+                // TODO: Add proper bounds checking for offset + 16 > packet_len
                 
-                // Load 128-bit value into Q0 from packet[offset]
+                // Prefetch potential next IPv6 data for cache optimization
+                emit_prfm(&jit, 0, ARM64_X3, 64);                 // PLDL1KEEP [X3, #64]
+                
+                // Load 128-bit value into Q0 from packet[offset] 
                 emit_ldr_q_imm(&jit, ARM64_Q0, ARM64_X3, 0);
                 
-                // Push to 128-bit stack: stack128[++sp128] = Q0
-                emit_mov_imm(&jit, ARM64_X4, 1);                   // Increment by 1 index
+                // Push to 128-bit stack using optimized scaled store
+                emit_mov_imm(&jit, ARM64_X4, 1);                   // Increment value
                 emit_add_reg(&jit, ARM64_X22, ARM64_X22, ARM64_X4); // sp128++
-                emit_calc_stack128_addr(&jit);                     // Calculate address in X4
-                emit_str_q_imm(&jit, ARM64_Q0, ARM64_X4, 0);       // stack128[sp128] = Q0
+                emit_str_q_scaled(&jit, ARM64_Q0, ARM64_X23, ARM64_X22); // stack128[sp128] = Q0
                 break;
             }
             
             case VFM_EQ128: {
-                // Compare two 128-bit values on stack for equality
+                // Optimized 128-bit comparison with NEON vectorized operations
                 
-                // Load second operand (top of stack) into Q1: Q1 = stack128[sp128]
-                emit_calc_stack128_addr(&jit);                     // Calculate address in X4
-                emit_ldr_q_imm(&jit, ARM64_Q1, ARM64_X4, 0);       // Q1 = stack128[sp128]
-                emit_mov_imm(&jit, ARM64_X4, 1);                   // Decrement by 1 index
-                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128--
+                // Load operands directly with scaled addressing (parallel execution possible)
+                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128-- (for second operand)
+                emit_ldr_q_scaled(&jit, ARM64_Q1, ARM64_X23, ARM64_X22); // Q1 = stack128[sp128] (top)
+                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128-- (for first operand)  
+                emit_ldr_q_scaled(&jit, ARM64_Q0, ARM64_X23, ARM64_X22); // Q0 = stack128[sp128-1] (second)
                 
-                // Load first operand into Q0: Q0 = stack128[sp128]
-                emit_calc_stack128_addr(&jit);                     // Calculate address in X4
-                emit_ldr_q_imm(&jit, ARM64_Q0, ARM64_X4, 0);       // Q0 = stack128[sp128]
-                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128--
-                
-                // Compare Q0 and Q1 for equality (CMEQ produces all-1s or all-0s per byte)
+                // Vectorized 128-bit comparison (CMEQ produces all-1s for equal bytes, all-0s for unequal)
                 emit_cmeq_v16b(&jit, ARM64_Q2, ARM64_Q0, ARM64_Q1);
                 
-                // Reduce Q2 to scalar: if all bytes are equal, all will be 0xFF (255)
-                // We need to check if all 16 bytes are 0xFF
-                emit_addp_v16b(&jit, ARM64_Q2, ARM64_Q2);           // Pairwise add within lanes
+                // Efficient single-instruction reduction: sum all bytes to check if all are 0xFF
+                emit_addv_v16b(&jit, ARM64_Q3, ARM64_Q2);          // Sum all 16 bytes into B3
                 
-                // Extract the low 64-bit lane and check if it equals 16*255 = 4080
-                emit_umov_x(&jit, ARM64_X3, ARM64_Q2, 0);           // Extract low 64 bits to X3
-                emit_mov_imm(&jit, ARM64_X4, 4080);                 // Expected value if all equal (16*255)
+                // Extract single byte result and check if it equals 16*255 = 4080 (0xFF0)
+                emit_umov_x(&jit, ARM64_X3, ARM64_Q3, 0);          // Extract summed byte to X3
                 
-                // Compare and set result: X3 = (X3 == 4080) ? 1 : 0
-                // For simplicity, just push 1 for now (this needs proper comparison logic)
-                emit_mov_imm(&jit, ARM64_X3, 1);                   // Simplified: assume equal
+                // Create comparison result: X3 = (X3 == 4080) ? 1 : 0
+                emit_mov_imm(&jit, ARM64_X4, 4080);               // Expected value for all equal
+                // CMP X3, X4; CSET X3, EQ (sets X3 = 1 if equal, 0 if not)
+                emit_u32(&jit, 0xeb04007f);                       // CMP X3, X4
+                emit_u32(&jit, 0x9a9f0063);                       // CSET X3, EQ
                 
-                // Push result to 64-bit stack
-                emit_mov_imm(&jit, ARM64_X4, 1);                   // Increment by 1 index
-                emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X4); // sp++
-                emit_str_imm(&jit, ARM64_X3, ARM64_X21, 0);        // stack[sp] = result
+                // Push result to 64-bit stack efficiently
+                emit_mov_imm(&jit, ARM64_X4, 1);                  // Prepare increment
+                emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X4); // sp++ (increment stack pointer)
+                emit_str_imm(&jit, ARM64_X3, ARM64_X21, 0);       // stack[sp] = result
+                break;
+            }
+            
+            // New optimized operations using NEON parallel load/store
+            
+            case VFM_BULK_LOAD128: {
+                // Bulk load multiple 128-bit values using NEON LDP for optimal bandwidth
+                uint8_t count = program[pc++];  // Number of 128-bit values to load
+                uint16_t offset = *(uint16_t*)&program[pc]; // Starting packet offset
+                pc += 2;
+                
+                if (count > 8) count = 8;  // Limit to available Q-registers
+                
+                // Calculate packet address
+                emit_mov_imm(&jit, ARM64_X3, offset);
+                emit_add_reg(&jit, ARM64_X3, ARM64_X1, ARM64_X3); // packet + offset
+                
+                // Prefetch multiple cache lines for bulk access
+                for (int i = 0; i < (count + 3) / 4; i++) {
+                    emit_prfm(&jit, 0, ARM64_X3, i * 64); // PLDL1KEEP every 64 bytes
+                }
+                
+                // Use bulk load function with NEON parallelism
+                emit_bulk_stack128_load(&jit, count, ARM64_X3, 0);
+                
+                // Update 128-bit stack pointer (sp128 += count)
+                emit_mov_imm(&jit, ARM64_X4, count);
+                emit_add_reg(&jit, ARM64_X22, ARM64_X22, ARM64_X4);
+                
+                // Store loaded values to 128-bit stack using bulk store
+                emit_bulk_stack128_store(&jit, count, ARM64_X23, 
+                    (int)((count - 1) * -16)); // Negative offset to store at stack top
+                break;
+            }
+            
+            case VFM_PARALLEL_EQ128: {
+                // Parallel comparison of multiple 128-bit values using NEON LDP
+                uint8_t count = program[pc++];  // Number of pairs to compare
+                
+                if (count > 4) count = 4;  // Limit to available Q-register pairs
+                
+                // Load pairs of 128-bit values from stack using LDP for bandwidth
+                for (int i = 0; i < count; i++) {
+                    // Load pair (2 values) for comparison
+                    emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 2); // sp128 -= 2
+                    emit_ldp_q(&jit, ARM64_Q0 + i*2, ARM64_Q1 + i*2, ARM64_X23, 
+                        (int)(ARM64_X22 * 16)); // Load pair from stack
+                    
+                    // Vectorized comparison
+                    emit_cmeq_v16b(&jit, ARM64_Q4 + i, ARM64_Q0 + i*2, ARM64_Q1 + i*2);
+                    
+                    // Reduce to scalar
+                    emit_addv_v16b(&jit, ARM64_Q4 + i, ARM64_Q4 + i);
+                }
+                
+                // Combine results and push to 64-bit stack
+                for (int i = 0; i < count; i++) {
+                    emit_umov_x(&jit, ARM64_X3 + i, ARM64_Q4 + i, 0);
+                    emit_mov_imm(&jit, ARM64_X4, 4080); // Expected value for equality
+                    // Compare and set result
+                    emit_u32(&jit, 0xeb04007f + (i << 5)); // CMP X(3+i), X4
+                    emit_u32(&jit, 0x9a9f0063 + (i << 5)); // CSET X(3+i), EQ
+                    
+                    // Push result to stack
+                    emit_mov_imm(&jit, ARM64_X4, 1);
+                    emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X4); // sp++
+                    emit_str_imm(&jit, ARM64_X3 + i, ARM64_X21, i * 8); // stack[sp+i] = result
+                }
+                break;
+            }
+            
+            case VFM_STACK_PREFETCH: {
+                // Prefetch upcoming stack region to optimize cache performance
+                uint8_t depth = program[pc++];  // How many cache lines to prefetch
+                
+                // Prefetch both 64-bit and 128-bit stacks
+                for (int i = 0; i < depth && i < 8; i++) {
+                    // Prefetch 64-bit stack
+                    emit_prfm(&jit, 0, ARM64_X21, i * 64); // PLDL1KEEP
+                    // Prefetch 128-bit stack
+                    emit_prfm(&jit, 0, ARM64_X23, i * 64); // PLDL1KEEP
+                }
                 break;
             }
             
