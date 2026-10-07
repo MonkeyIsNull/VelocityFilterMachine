@@ -1,10 +1,19 @@
 # Velocity Filter Machine (VFM) Makefile
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -march=native -I./include -I./src
-LDFLAGS = 
+# Portable by default: no -march=native, so binaries run on any CPU of the
+# target architecture (important for CI and for shipping release binaries).
+# Opt into native-CPU tuning with `make NATIVE=1` for a faster but
+# non-portable build that may SIGILL if run on a different/older CPU.
+CFLAGS = -Wall -Wextra -O3 -I./include -I./src
+LDFLAGS =
 DEBUG_FLAGS = -g -O0 -DDEBUG
 TEST_FLAGS = -I./test
+
+# Native-CPU tuning (opt-in, non-portable)
+ifdef NATIVE
+    CFLAGS += -march=native -mtune=native
+endif
 
 # Platform-specific optimizations
 UNAME_S := $(shell uname -s)
@@ -12,8 +21,8 @@ ifeq ($(UNAME_S),Darwin)
     # macOS optimizations
     LDFLAGS += -framework Accelerate
     ifdef APPLE_SILICON
-        # Apple Silicon specific flags
-        CFLAGS += -mcpu=apple-m1 -mtune=native
+        # Apple Silicon specific flags (opt-in, non-portable)
+        CFLAGS += -mcpu=apple-m1
     endif
     # Use clang on macOS for better optimization
     CC = clang
@@ -30,8 +39,7 @@ ifeq ($(UNAME_S),Darwin)
         SIGNING_IDENTITY = -
     endif
 else ifeq ($(UNAME_S),Linux)
-    # Linux optimizations
-    CFLAGS += -march=native -mtune=native
+    # Linux optimizations (native tuning is opt-in via NATIVE=1, handled above)
     LDFLAGS += -lpthread
 endif
 
@@ -86,7 +94,7 @@ TOOLS = $(TOOL_SRCS:.c=)
 VFLISPC = $(VFLISP_DIR)/vflispc
 
 # Test sources
-TEST_SRCS = $(TEST_DIR)/test_vfm.c
+TEST_SRCS = $(TEST_DIR)/test_vfm.c $(TEST_DIR)/jit_test.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Benchmark sources
@@ -145,9 +153,20 @@ $(VFLISP_DIR)/%.o: $(VFLISP_DIR)/%.c
 
 # Tests
 test: $(TEST_BINS)
+	@echo "=== Running VFM unit tests ==="
 	./$(TEST_DIR)/test_vfm
+	@echo ""
+	@echo "=== Running VFM JIT tests ==="
+	./$(TEST_DIR)/jit_test
 
 $(TEST_DIR)/test_vfm: $(TEST_DIR)/test_vfm.c libvfm.a
+	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+endif
+
+$(TEST_DIR)/jit_test: $(TEST_DIR)/jit_test.c libvfm.a
 	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
 ifeq ($(UNAME_S),Darwin)
 	@echo "Code signing $@ for JIT support..."

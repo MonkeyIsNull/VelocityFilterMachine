@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build-and-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          cc --version || true
+          gcc --version || true
+          clang --version || true
+          make --version || true
+
+      - name: Build (portable default)
+        run: make 2>&1 | tee build.log
+
+      - name: Verify default build is portable (no -march=native)
+        shell: bash
+        run: |
+          if grep -q "march=native" build.log; then
+            echo "ERROR: the default build used -march=native (should be opt-in via NATIVE=1)"
+            exit 1
+          fi
+          echo "OK: default build is portable"
+
+      - name: Run tests
+        run: make test
+
+      - name: Native (opt-in) build smoke test
+        run: |
+          make clean
+          make NATIVE=1
