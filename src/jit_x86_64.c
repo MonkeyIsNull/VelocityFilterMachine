@@ -801,6 +801,20 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
     // Compile VFM instructions
     uint32_t pc = 0;
     while (pc < len) {
+        // Safety: the operand stack is tracked in a fixed-size register map
+        // (jit.stack_regs). The widest instruction (PUSH128/LD128) pushes two
+        // slots, so require two slots of headroom before compiling any
+        // instruction. If the program's stack depth would exceed what the JIT
+        // can represent, abort compilation and fall back to the safe
+        // interpreter instead of writing past stack_regs[] -- an overflow that
+        // corrupts the adjacent struct fields (next_reg, labels) and crashes
+        // in free(jit.labels). The interpreter still enforces the real
+        // VFM_ERROR_STACK_OVERFLOW limit at runtime.
+        if (jit.stack_depth + 2 > sizeof(jit.stack_regs) / sizeof(jit.stack_regs[0])) {
+            free(jit.labels);
+            munmap(code, code_size);
+            return NULL;
+        }
         uint8_t opcode = program[pc++];
         
         switch (opcode) {
