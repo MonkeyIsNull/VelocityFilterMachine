@@ -14,7 +14,7 @@ At the moment, this is meant to be paired with [PacketVelocity](https://github.c
 VFM is designed to be an extremley fast and safe packet filtering. It combines:
 
 - **VFLisp DSL**: High-level Lisp-like language for intuitive filter programming
-- **High Performance**: Optimized interpreter with computed goto dispatch achieving 10M+ packets/second
+- **High Performance**: Optimized interpreter with computed-goto dispatch (see the Performance section for throughput targets and their current verification status)
 - **Safety First**: Static program verification prevents crashes and ensures bounded execution
 - **Zero-Copy**: Direct packet access without memory copying for maximum throughput
 - **Cross-Platform**: Runs on Linux, macOS, and BSD systems (see Linux compatibility notes below)
@@ -97,7 +97,7 @@ codesign --entitlements entitlements.plist -s "Developer ID Application: Your Na
 - CPU affinity optimizations disabled
 
 **Performance on Linux:**
-- Interpreter mode: Full performance (10M+ packets/second)
+- Interpreter mode: full interpreter performance (throughput targets listed in the Performance section are not yet CI-verified)
 - ARM64 systems: JIT available with good performance
 - x86_64 systems: Falls back to interpreter (still high performance)
 
@@ -140,6 +140,17 @@ For easy integration, use the single header version:
 ## Note
 
 Right now, this is very alpha software. You'll note there is no release and no version number. It is written with PacketVelocity in mind, which is also alphaware, so your mileage may vary with other usage. Feel free to submit issues and PRs.
+
+### Experimental / Not Yet Implemented
+
+Some capabilities exposed in the public header are **experimental and not production-ready**. Treat them as work-in-progress:
+
+- **Multi-core batch execution** (`vfm_multicore_*` API): the worker path is a placeholder and does **not** currently run the filter per packet (it returns a fixed "accept" result). Do not rely on it for real filtering yet.
+- **Profile-guided / adaptive JIT** (`VFM_JIT_OPT_ADAPTIVE`, `*_adaptive` compile functions, `vfm_execution_profile_t`): the profiling data structures exist, but adaptive recompilation is not wired into a working execution path.
+- **x86-64 JIT**: present and compiles, but is less complete than the ARM64 backend; the interpreter is the supported execution path on x86-64.
+- **Non-core BPF/XDP export targets**: partial.
+
+What **is** covered by the runnable test suite (`make test`) today: the single-core bytecode interpreter (arithmetic, stack, packet loads, conditional jumps), static verification, bounds/stack/instruction-limit/division-by-zero safety checks, the flow table, 5-tuple hashing, a real TCP-SYN filter, and ARM64 JIT compilation availability.
 
 
 ## Quick Start
@@ -462,7 +473,7 @@ vfm_enable_jit(vm);  // Compile to native code
 
 ## Performance
 
-VFM achieves exceptional performance through:
+VFM is designed for high throughput through:
 
 - **VFLisp Optimization**: High-level DSL compiles to efficient bytecode
 - **Computed Goto**: Eliminates switch statement overhead
@@ -470,11 +481,18 @@ VFM achieves exceptional performance through:
 - **Bounds Checking**: Optimized memory access validation
 - **JIT Compilation**: Native code generation for hot paths
 
-Benchmark results on Apple M1:
-- **VFLisp IPv4 filters**: 20M+ packets/second
-- **VFLisp IPv6 filters**: 15M+ packets/second (with JIT)
-- **Assembly filters**: 25M+ packets/second
-- **Complex IPv6 filters**: 10M+ packets/second
+> **Note on the numbers below.** These are design targets / informal
+> measurements from earlier development, not results reproduced by the current
+> automated test suite or CI. The repository does not yet ship a benchmark that
+> regenerates them, so treat them as aspirational until a reproducible
+> `make bench` harness lands. The figures assume the single-core interpreter /
+> JIT path, not the experimental multi-core API.
+
+Design targets (Apple M1, simple filters):
+- **VFLisp IPv4 filters**: ~20M packets/second
+- **VFLisp IPv6 filters**: ~15M packets/second (with JIT)
+- **Assembly filters**: ~25M packets/second
+- **Complex IPv6 filters**: ~10M packets/second
 - **Memory usage**: <1MB per VM instance
 
 ## Security

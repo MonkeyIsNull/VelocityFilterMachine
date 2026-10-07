@@ -7,8 +7,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#include "../src/vfm.h"
-#include "../src/opcodes.h"
+#include "../include/vfm.h"
 
 // Test framework macros
 #define TEST_ASSERT(condition) \
@@ -89,8 +88,8 @@ static uint8_t* create_test_packet(uint16_t *len) {
 static int test_vm_creation(void) {
     vfm_state_t *vm = vfm_create();
     TEST_ASSERT(vm != NULL);
-    TEST_ASSERT(vm->stack != NULL);
-    TEST_ASSERT(vm->stack_size == VFM_MAX_STACK);
+    TEST_ASSERT(vm->hot.stack != NULL);
+    TEST_ASSERT(vm->hot.stack_size == VFM_MAX_STACK);
     TEST_ASSERT(vm->hot.insn_limit == VFM_MAX_INSN);
     
     vfm_destroy(vm);
@@ -327,7 +326,7 @@ static int test_stack_overflow(void) {
     TEST_ASSERT_EQ(VFM_SUCCESS, result);
     
     // Reduce stack limit to trigger overflow
-    vm->stack_size = 20;  // Force overflow at 20 instead of 256
+    vm->hot.stack_size = 20;  // Force overflow at 20 instead of 256
     
     uint16_t packet_len;
     uint8_t *packet = create_test_packet(&packet_len);
@@ -339,8 +338,7 @@ static int test_stack_overflow(void) {
     return 0;
 }
 
-// Test instruction limit - currently disabled due to execution issues
-#if 0
+// Test instruction limit enforcement
 static int test_instruction_limit(void) {
     vfm_state_t *vm = vfm_create();
     TEST_ASSERT(vm != NULL);
@@ -373,10 +371,8 @@ static int test_instruction_limit(void) {
     vfm_destroy(vm);
     return 0;
 }
-#endif
 
-// Test division by zero - currently disabled due to execution issues
-#if 0
+// Test division by zero detection
 static int test_division_by_zero(void) {
     vfm_state_t *vm = vfm_create();
     TEST_ASSERT(vm != NULL);
@@ -401,10 +397,8 @@ static int test_division_by_zero(void) {
     vfm_destroy(vm);
     return 0;
 }
-#endif
 
-// Performance test (currently disabled due to execution issues)
-#if 0
+// Basic sanity/performance smoke test
 static int test_performance(void) {
     // Simple performance test - just verify basic VM functionality
     vfm_state_t *vm = vfm_create();
@@ -431,10 +425,8 @@ static int test_performance(void) {
     vfm_destroy(vm);
     return 0;
 }
-#endif
 
-// Real-world filter test (TCP SYN detection) - currently disabled
-#if 0
+// Real-world filter test (TCP SYN detection)
 static int test_tcp_syn_filter(void) {
     vfm_state_t *vm = vfm_create();
     TEST_ASSERT(vm != NULL);
@@ -475,7 +467,6 @@ static int test_tcp_syn_filter(void) {
     vfm_destroy(vm);
     return 0;
 }
-#endif
 
 // Run all tests
 int main(void) {
@@ -492,14 +483,10 @@ int main(void) {
     RUN_TEST(test_flow_table);
     RUN_TEST(test_hash_function);
     RUN_TEST(test_stack_overflow);
-    // Instruction limit test temporarily disabled - causes abort
-    printf("Running test_instruction_limit... SKIPPED (instruction limit handling verified separately)\n");
-    // Division by zero test temporarily disabled - causes abort
-    printf("Running test_division_by_zero... SKIPPED (division by zero handling verified separately)\n");
-    // TCP SYN filter test temporarily disabled - complex jump calculations
-    printf("Running test_tcp_syn_filter... SKIPPED (complex filter testing available via examples)\n");
-    // Performance test temporarily disabled due to execution hang
-    printf("Running test_performance... SKIPPED (performance testing available via benchmarks)\n");
+    RUN_TEST(test_instruction_limit);
+    RUN_TEST(test_division_by_zero);
+    RUN_TEST(test_tcp_syn_filter);
+    RUN_TEST(test_performance);
     
     printf("\n==============\n");
     printf("Tests: %d total, %d passed, %d failed\n", 

@@ -77,3 +77,10 @@ tools/vfm-asm
 tools/vfm-dis
 tools/vfm-test
 
+# Test harness binaries (build outputs)
+test/test_vfm
+test/jit_test
+
+# Benchmark binary
+bench/bench
+
