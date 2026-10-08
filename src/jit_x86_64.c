@@ -99,12 +99,12 @@ static void free_reg(x86_64_jit_t *jit, uint8_t reg);
 // x86-64 instruction generation
 static void emit_mov_reg_imm64(x86_64_jit_t *jit, uint8_t reg, uint64_t imm);
 static void emit_mov_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
-static void emit_mov_reg_mem(x86_64_jit_t *jit, uint8_t reg, uint8_t base, int32_t offset);
-static void emit_mov_mem_reg(x86_64_jit_t *jit, uint8_t base, int32_t offset, uint8_t reg);
+static void __attribute__((unused)) emit_mov_reg_mem(x86_64_jit_t *jit, uint8_t reg, uint8_t base, int32_t offset);
+static void __attribute__((unused)) emit_mov_mem_reg(x86_64_jit_t *jit, uint8_t base, int32_t offset, uint8_t reg);
 static void emit_add_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
 static void emit_sub_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
 static void emit_mul_reg(x86_64_jit_t *jit, uint8_t reg);
-static void emit_div_reg(x86_64_jit_t *jit, uint8_t reg);
+static void __attribute__((unused)) emit_div_reg(x86_64_jit_t *jit, uint8_t reg);
 static void emit_and_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
 static void emit_or_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
 static void emit_xor_reg_reg(x86_64_jit_t *jit, uint8_t dst, uint8_t src);
@@ -113,11 +113,11 @@ static void emit_shr_reg_cl(x86_64_jit_t *jit, uint8_t reg);
 static void emit_not_reg(x86_64_jit_t *jit, uint8_t reg);
 static void emit_neg_reg(x86_64_jit_t *jit, uint8_t reg);
 static void emit_cmp_reg_reg(x86_64_jit_t *jit, uint8_t reg1, uint8_t reg2);
-static void emit_je_rel32(x86_64_jit_t *jit, int32_t offset);
-static void emit_jne_rel32(x86_64_jit_t *jit, int32_t offset);
-static void emit_jg_rel32(x86_64_jit_t *jit, int32_t offset);
-static void emit_jl_rel32(x86_64_jit_t *jit, int32_t offset);
-static void emit_jmp_rel32(x86_64_jit_t *jit, int32_t offset);
+static void __attribute__((unused)) emit_je_rel32(x86_64_jit_t *jit, int32_t offset);
+static void __attribute__((unused)) emit_jne_rel32(x86_64_jit_t *jit, int32_t offset);
+static void __attribute__((unused)) emit_jg_rel32(x86_64_jit_t *jit, int32_t offset);
+static void __attribute__((unused)) emit_jl_rel32(x86_64_jit_t *jit, int32_t offset);
+static void __attribute__((unused)) emit_jmp_rel32(x86_64_jit_t *jit, int32_t offset);
 static void emit_push_reg(x86_64_jit_t *jit, uint8_t reg);
 static void emit_pop_reg(x86_64_jit_t *jit, uint8_t reg);
 static void emit_ret(x86_64_jit_t *jit);
@@ -170,17 +170,38 @@ static void emit_qword(x86_64_jit_t *jit, uint64_t qword) {
     emit_dword(jit, (qword >> 32) & 0xFFFFFFFF);
 }
 
-// Register allocation for stack simulation
+// Sentinel returned by alloc_reg when the register-based operand stack has no
+// free physical register left. Callers MUST treat this as "cannot compile" and
+// decline (return NULL) so execution falls back to the bounds-checked
+// interpreter -- never emit code that aliases two live stack slots onto the
+// same register, which silently corrupts results.
+#define REG_NONE 0xFF
+
+// Register allocation for the register-modelled operand stack.
+//
+// The operand stack is modelled in the eight registers R8-R15. Each live stack
+// slot occupies exactly one of them; a value "carries" its register as it moves
+// (SWAP swaps the names, arithmetic consumes the top). The previous allocator
+// used a monotonically increasing counter that (a) never recycled a register
+// after a POP and (b) silently aliased every allocation past the eighth onto R8
+// -- so any program with more than eight cumulative pushes produced wrong
+// results. This allocator instead derives liveness from the current stack
+// contents: it returns the lowest-numbered register not already holding a live
+// stack slot, or REG_NONE when all eight are in use (depth would exceed 8).
 static uint8_t alloc_reg(x86_64_jit_t *jit) {
-    // Use R8-R15 for stack simulation, preserve others for packet access
-    static uint8_t available_regs[] = {R8, R9, R10, R11, R12, R13, R14, R15};
-    
-    if (jit->next_reg < 8) {
-        return available_regs[jit->next_reg++];
+    static const uint8_t available_regs[] = {R8, R9, R10, R11, R12, R13, R14, R15};
+
+    for (uint32_t i = 0; i < sizeof(available_regs) / sizeof(available_regs[0]); i++) {
+        uint8_t candidate = available_regs[i];
+        bool in_use = false;
+        for (uint32_t j = 0; j < jit->stack_depth; j++) {
+            if (jit->stack_regs[j] == candidate) { in_use = true; break; }
+        }
+        if (!in_use) {
+            return candidate;
+        }
     }
-    
-    // Fallback to R8 if we run out
-    return R8;
+    return REG_NONE;  // operand stack deeper than the 8 available registers
 }
 
 static void free_reg(x86_64_jit_t *jit, uint8_t reg) {
@@ -399,32 +420,39 @@ static void emit_ret(x86_64_jit_t *jit) {
     emit_byte(jit, 0xC3);  // RET
 }
 
-// Function prologue: set up stack frame
+// Function prologue: set up the stack frame and preserve callee-saved state.
+//
+// The operand stack is modelled in R8-R15 (see alloc_reg). Of those, R12-R15
+// are callee-saved under the x86-64 System V ABI, so they MUST be preserved
+// across the call or we corrupt the caller's registers. The previous prologue
+// saved only RBP and clobbered R12-R15 for any program deep enough to allocate
+// them -- an ABI violation. We now push R12-R15 and restore them in the
+// epilogue. (We do not use RBX, so it is left untouched.) R8-R11 are
+// caller-saved and need no preservation.
 static void emit_prologue(x86_64_jit_t *jit) {
-    // push rbp
+    // push rbp ; mov rbp, rsp
     emit_push_reg(jit, RBP);
-    // mov rbp, rsp
     emit_mov_reg_reg(jit, RBP, RSP);
-    // Allocate space for local variables (stack simulation)
-    // sub rsp, 256  (32 * 8 bytes for stack slots)
-    emit_byte(jit, rex_prefix(1, 0, 0, 0));
-    emit_byte(jit, 0x81);  // SUB r/m64, imm32
-    emit_byte(jit, modrm_byte(3, 5, RSP));
-    emit_dword(jit, 256);
+    // Preserve callee-saved registers used as operand-stack slots.
+    emit_push_reg(jit, R12);
+    emit_push_reg(jit, R13);
+    emit_push_reg(jit, R14);
+    emit_push_reg(jit, R15);
 }
 
-// Function epilogue: clean up and return
+// Function epilogue: restore callee-saved state and return.
 static void emit_epilogue(x86_64_jit_t *jit) {
     // Ensure AVX state is properly cleaned up
     if (jit->use_avx2) {
         emit_vzeroupper(jit);
     }
-    
-    // mov rsp, rbp
-    emit_mov_reg_reg(jit, RSP, RBP);
-    // pop rbp
+
+    // Restore callee-saved registers (reverse push order), then rbp, then ret.
+    emit_pop_reg(jit, R15);
+    emit_pop_reg(jit, R14);
+    emit_pop_reg(jit, R13);
+    emit_pop_reg(jit, R12);
     emit_pop_reg(jit, RBP);
-    // ret
     emit_ret(jit);
 }
 
@@ -644,7 +672,7 @@ static void emit_vmovdqu_ymm_mem(x86_64_jit_t *jit, uint8_t ymm, uint8_t base, i
 }
 
 // VMOVDQU [mem], YMM - unaligned 256-bit store
-static void emit_vmovdqu_mem_ymm(x86_64_jit_t *jit, uint8_t base, int32_t offset, uint8_t ymm) {
+static void __attribute__((unused)) emit_vmovdqu_mem_ymm(x86_64_jit_t *jit, uint8_t base, int32_t offset, uint8_t ymm) {
     // VEX.256.F3.0F.WIG 7F /r
     uint8_t rxb = 0xE0 | (1 << 2);  // RXB bits + map_select (0F)
     uint8_t w_vvvv_l_pp = 0x44;     // W=0, vvvv=1111, L=1 (256-bit), pp=01 (F3)
@@ -761,6 +789,25 @@ static void __attribute__((unused)) emit_avx2_parallel_128bit_cmp(x86_64_jit_t *
     emit_cmp_reg_reg(jit, RAX, RCX);
 }
 
+// Emit a packet-bounds check for a load of `sz` bytes at packet offset `off`.
+// Mirrors the interpreter's BOUNDS_CHECK: if packet_len < off+sz the load would
+// read past the packet, so branch to the shared failure handler at
+// `fail_target` (which returns VFM_ERROR_BOUNDS). The uint16 packet_len
+// argument is passed zero-extended in ESI, so a 32-bit compare is exact and
+// does not depend on the undefined high 48 bits of RSI.
+static void emit_load_bounds_check(x86_64_jit_t *jit, uint32_t fail_target,
+                                   uint32_t off, uint32_t sz) {
+    // cmp esi, off+sz
+    emit_byte(jit, 0x81);
+    emit_byte(jit, modrm_byte(3, 7, RSI));  // /7 = CMP, rm = RSI
+    emit_dword(jit, off + sz);
+    // jb fail  (unsigned: packet_len < off+sz => out of bounds)
+    emit_byte(jit, 0x0F);
+    emit_byte(jit, 0x82);
+    int32_t rel = (int32_t)(fail_target - (jit->code_pos + 4));
+    emit_dword(jit, (uint32_t)rel);
+}
+
 // Main JIT compilation function
 void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
     if (!program || len == 0) {
@@ -797,7 +844,26 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
     
     // Emit function prologue
     emit_prologue(&jit);
-    
+
+    // Emit the shared bounds-failure handler once, up front, and jump over it
+    // on the normal path. Loads branch here when an offset would read past the
+    // packet; it returns VFM_ERROR_BOUNDS (-1), exactly what the interpreter
+    // returns for an out-of-bounds load, so the JIT and oracle agree even on
+    // malformed offsets.
+    emit_byte(&jit, 0xE9);                   // JMP rel32 over the handler
+    uint32_t jmp_patch = jit.code_pos;
+    emit_dword(&jit, 0);                     // placeholder displacement
+    uint32_t fail_target = jit.code_pos;     // handler entry
+    emit_mov_reg_imm64(&jit, RAX, (uint64_t)(int64_t)VFM_ERROR_BOUNDS);
+    emit_epilogue(&jit);
+    {
+        int32_t over_rel = (int32_t)(jit.code_pos - (jmp_patch + 4));
+        jit.code[jmp_patch + 0] = (uint8_t)(over_rel & 0xFF);
+        jit.code[jmp_patch + 1] = (uint8_t)((over_rel >> 8) & 0xFF);
+        jit.code[jmp_patch + 2] = (uint8_t)((over_rel >> 16) & 0xFF);
+        jit.code[jmp_patch + 3] = (uint8_t)((over_rel >> 24) & 0xFF);
+    }
+
     // Compile VFM instructions
     uint32_t pc = 0;
     while (pc < len) {
@@ -811,9 +877,7 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
         // in free(jit.labels). The interpreter still enforces the real
         // VFM_ERROR_STACK_OVERFLOW limit at runtime.
         if (jit.stack_depth + 2 > sizeof(jit.stack_regs) / sizeof(jit.stack_regs[0])) {
-            free(jit.labels);
-            munmap(code, code_size);
-            return NULL;
+            goto decline;
         }
         uint8_t opcode = program[pc++];
         
@@ -821,69 +885,96 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
             case VFM_LD8: {
                 uint16_t offset = *(uint16_t*)&program[pc];
                 pc += 2;
-                
+
                 uint8_t reg = alloc_reg(&jit);
-                // Load byte from packet: mov reg, byte ptr [rsi + offset]
-                // (RDI = packet pointer, SysV integer arg0)
+                if (reg == REG_NONE) goto decline;
+
+                // Interpreter op_ld8: BOUNDS_CHECK(offset, 1); push packet[offset]
+                // as a zero-extended byte. Previously this emitted MOV r8, [rdi+off]
+                // (opcode 0x8A writes ONLY bits 0-7) followed by a 64-bit reg->reg
+                // self-move, leaving bits 8-63 holding register-allocator garbage
+                // -- so any later use of the value (compare, arith) diverged from
+                // the interpreter. Use MOVZX r32, byte [rdi+off] (0F B6), which
+                // zero-extends the loaded byte across the full 64-bit register
+                // (a 32-bit destination write clears bits 32-63).
+                emit_load_bounds_check(&jit, fail_target, offset, 1);
                 emit_byte(&jit, rex_prefix(0, reg >= 8 ? 1 : 0, 0, 0));
-                emit_byte(&jit, 0x8A);  // MOV r8, r/m8
+                emit_byte(&jit, 0x0F);
+                emit_byte(&jit, 0xB6);  // MOVZX r32, r/m8
                 emit_byte(&jit, modrm_byte(2, reg & 7, RDI));
                 emit_dword(&jit, offset);
-                
-                // Zero-extend to 64-bit
-                emit_mov_reg_reg(&jit, reg, reg);
-                
+
                 jit.stack_regs[jit.stack_depth++] = reg;
                 break;
             }
-            
+
             case VFM_LD16: {
                 uint16_t offset = *(uint16_t*)&program[pc];
                 pc += 2;
-                
+
                 uint8_t reg = alloc_reg(&jit);
-                // Load word: mov reg, word ptr [rsi + offset]
-                emit_byte(&jit, 0x66);  // 16-bit override
+                if (reg == REG_NONE) goto decline;
+
+                // Interpreter op_ld16: BOUNDS_CHECK(offset, 2); push
+                // ntohs(*(uint16*)(packet+offset)) zero-extended. Previously this
+                // used a 16-bit MOV (0x66 0x8B) that writes only bits 0-15 (bits
+                // 16-63 kept garbage) and then BSWAP r16, whose result is
+                // architecturally undefined for a 16-bit operand. Use MOVZX r32,
+                // word [rdi+off] (0F B7) to load and zero-extend, then ROR r16, 8
+                // to byte-swap the two bytes (ntohs on a little-endian host). ROR
+                // on the 16-bit operand leaves the already-zero bits 16-63 intact.
+                emit_load_bounds_check(&jit, fail_target, offset, 2);
                 emit_byte(&jit, rex_prefix(0, reg >= 8 ? 1 : 0, 0, 0));
-                emit_byte(&jit, 0x8B);
+                emit_byte(&jit, 0x0F);
+                emit_byte(&jit, 0xB7);  // MOVZX r32, r/m16
                 emit_byte(&jit, modrm_byte(2, reg & 7, RDI));
                 emit_dword(&jit, offset);
-                
-                // Convert network to host order (bswap)
-                emit_byte(&jit, 0x66);
-                if (reg >= 8) emit_byte(&jit, rex_prefix(0, 0, 0, 1));
-                emit_byte(&jit, 0x0F);
-                emit_byte(&jit, 0xC8 + (reg & 7));  // BSWAP r16
-                
+
+                // ror reg16, 8  (swap the two bytes => network-to-host order)
+                emit_byte(&jit, 0x66);                               // 16-bit operand
+                if (reg >= 8) emit_byte(&jit, rex_prefix(0, 0, 0, 1)); // REX.B
+                emit_byte(&jit, 0xC1);                               // ROR r/m16, imm8
+                emit_byte(&jit, modrm_byte(3, 1, reg & 7));          // /1 = ROR
+                emit_byte(&jit, 8);
+
                 jit.stack_regs[jit.stack_depth++] = reg;
                 break;
             }
-            
+
             case VFM_LD32: {
                 uint16_t offset = *(uint16_t*)&program[pc];
                 pc += 2;
-                
+
                 uint8_t reg = alloc_reg(&jit);
-                // Load dword: mov reg, dword ptr [rsi + offset]
+                if (reg == REG_NONE) goto decline;
+
+                // Interpreter op_ld32: BOUNDS_CHECK(offset, 4); push
+                // ntohl(*(uint32*)(packet+offset)) zero-extended. A 32-bit MOV
+                // into the register's low half auto-zero-extends bits 32-63, and
+                // BSWAP on the 32-bit operand converts network to host order and
+                // likewise leaves bits 32-63 clear -- so this load was already
+                // correct; we only add the missing bounds check.
+                emit_load_bounds_check(&jit, fail_target, offset, 4);
                 emit_byte(&jit, rex_prefix(0, reg >= 8 ? 1 : 0, 0, 0));
-                emit_byte(&jit, 0x8B);
+                emit_byte(&jit, 0x8B);  // MOV r32, r/m32
                 emit_byte(&jit, modrm_byte(2, reg & 7, RDI));
                 emit_dword(&jit, offset);
-                
+
                 // Convert network to host order
                 if (reg >= 8) emit_byte(&jit, rex_prefix(0, 0, 0, 1));
                 emit_byte(&jit, 0x0F);
                 emit_byte(&jit, 0xC8 + (reg & 7));  // BSWAP r32
-                
+
                 jit.stack_regs[jit.stack_depth++] = reg;
                 break;
             }
-            
+
             case VFM_PUSH: {
                 uint64_t value = *(uint64_t*)&program[pc];
                 pc += 8;
-                
+
                 uint8_t reg = alloc_reg(&jit);
+                if (reg == REG_NONE) goto decline;
                 emit_mov_reg_imm64(&jit, reg, value);
                 jit.stack_regs[jit.stack_depth++] = reg;
                 break;
@@ -901,6 +992,7 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 if (jit.stack_depth > 0) {
                     uint8_t src_reg = jit.stack_regs[jit.stack_depth - 1];
                     uint8_t dst_reg = alloc_reg(&jit);
+                    if (dst_reg == REG_NONE) goto decline;
                     emit_mov_reg_reg(&jit, dst_reg, src_reg);
                     jit.stack_regs[jit.stack_depth++] = dst_reg;
                 }
@@ -917,38 +1009,44 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 break;
             }
             
+            // VFM_DIV is intentionally DECLINED. The interpreter's op_div checks
+            // for a zero divisor and returns VFM_ERROR_DIVISION_BY_ZERO; the only
+            // faithful x86 encoding (DIV r64) instead raises #DE and crashes the
+            // process on a zero divisor. Because the divisor can be packet-driven,
+            // the JIT cannot prove it non-zero, so rather than emit code that
+            // diverges from the oracle (crash vs. error return) we bail to the
+            // bounds-checked interpreter, which handles division-by-zero safely.
+            case VFM_DIV:
+                goto decline;
+
             case VFM_ADD:
             case VFM_SUB:
             case VFM_MUL:
-            case VFM_DIV:
             case VFM_AND:
             case VFM_OR:
             case VFM_XOR: {
                 if (jit.stack_depth >= 2) {
                     uint8_t reg_b = jit.stack_regs[--jit.stack_depth];
                     uint8_t reg_a = jit.stack_regs[jit.stack_depth - 1];
-                    
+
                     switch (opcode) {
                         case VFM_ADD: emit_add_reg_reg(&jit, reg_a, reg_b); break;
                         case VFM_SUB: emit_sub_reg_reg(&jit, reg_a, reg_b); break;
                         case VFM_MUL:
-                            // Move to RAX for multiply
+                            // Move to RAX for multiply; MUL r64 computes
+                            // RDX:RAX = RAX * reg_b, and we keep the low 64 bits
+                            // (matching the interpreter's a * b wraparound). RAX
+                            // and RDX are scratch here -- the operand stack only
+                            // ever lives in R8-R15 -- so clobbering them is safe.
                             emit_mov_reg_reg(&jit, RAX, reg_a);
                             emit_mul_reg(&jit, reg_b);
-                            emit_mov_reg_reg(&jit, reg_a, RAX);
-                            break;
-                        case VFM_DIV:
-                            // Clear RDX, move to RAX for divide
-                            emit_xor_reg_reg(&jit, RDX, RDX);
-                            emit_mov_reg_reg(&jit, RAX, reg_a);
-                            emit_div_reg(&jit, reg_b);
                             emit_mov_reg_reg(&jit, reg_a, RAX);
                             break;
                         case VFM_AND: emit_and_reg_reg(&jit, reg_a, reg_b); break;
                         case VFM_OR:  emit_or_reg_reg(&jit, reg_a, reg_b); break;
                         case VFM_XOR: emit_xor_reg_reg(&jit, reg_a, reg_b); break;
                     }
-                    
+
                     free_reg(&jit, reg_b);
                 }
                 break;
@@ -988,185 +1086,39 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 break;
             }
             
+            // All control-flow opcodes are DECLINED. The previous emitters
+            // computed the x86 branch displacement as `vfm_offset * 16` -- a
+            // "rough estimate" that does not correspond to any real instruction
+            // boundary, so the branch landed at an arbitrary address. The signed
+            // conditional jumps (JG/JL) were also wrong for the interpreter's
+            // UNSIGNED comparisons (a > b on uint64). Correct branching requires
+            // a two-pass VFM-pc -> x86-offset label/fixup map that this compiler
+            // does not implement. Rather than emit a branch to a bogus target,
+            // decline and let the interpreter run the program correctly.
             case VFM_JEQ:
             case VFM_JNE:
             case VFM_JGT:
-            case VFM_JLT: {
-                int16_t offset = *(int16_t*)&program[pc];
-                pc += 2;
-                
-                if (jit.stack_depth >= 2) {
-                    uint8_t reg_b = jit.stack_regs[--jit.stack_depth];
-                    uint8_t reg_a = jit.stack_regs[--jit.stack_depth];
-                    
-                    emit_cmp_reg_reg(&jit, reg_a, reg_b);
-                    
-                    // Calculate jump target (simplified)
-                    int32_t jump_offset = offset * 16;  // Rough estimate
-                    
-                    switch (opcode) {
-                        case VFM_JEQ: emit_je_rel32(&jit, jump_offset); break;
-                        case VFM_JNE: emit_jne_rel32(&jit, jump_offset); break;
-                        case VFM_JGT: emit_jg_rel32(&jit, jump_offset); break;
-                        case VFM_JLT: emit_jl_rel32(&jit, jump_offset); break;
-                    }
-                    
-                    free_reg(&jit, reg_a);
-                    free_reg(&jit, reg_b);
-                }
-                break;
-            }
+            case VFM_JLT:
+            case VFM_JMP:
+                goto decline;
             
-            case VFM_JMP: {
-                int16_t offset = *(int16_t*)&program[pc];
-                pc += 2;
-                
-                int32_t jump_offset = offset * 16;  // Rough estimate
-                emit_jmp_rel32(&jit, jump_offset);
-                break;
-            }
-            
-            case VFM_LD128: {
-                uint16_t offset = *(uint16_t*)&program[pc];
-                pc += 2;
-                
-                if (jit.use_avx2) {
-                    // AVX2 optimized version for Phase 2.2
-                    // Load 128-bit value directly into YMM register, then store to stack
-                    
-                    // Load 128-bit IPv6 address from packet: VMOVDQU YMM0, [RDI + offset]
-                    emit_vmovdqu_ymm_mem(&jit, YMM0, RDI, offset);
-                    
-                    // Store to stack as two 64-bit values for register allocation
-                    emit_vmovdqu_mem_ymm(&jit, RSP, -16, YMM0);  // Store lower 128-bits
-                    
-                    // Load back into general-purpose registers for stack management
-                    uint8_t reg_low = alloc_reg(&jit);
-                    uint8_t reg_high = alloc_reg(&jit);
-                    
-                    emit_mov_reg_mem(&jit, reg_low, RSP, -16);   // Low 64 bits
-                    emit_mov_reg_mem(&jit, reg_high, RSP, -8);   // High 64 bits
-                    
-                    // Push both values on stack (low first, then high)
-                    jit.stack_regs[jit.stack_depth++] = reg_low;
-                    jit.stack_regs[jit.stack_depth++] = reg_high;
-                    
-                } else {
-                    // Scalar fallback implementation
-                    // Load 128-bit IPv6 address from packet as two 64-bit values
-                    uint8_t reg_low = alloc_reg(&jit);
-                    uint8_t reg_high = alloc_reg(&jit);
-                    
-                    // Load low 64 bits: mov reg_low, qword ptr [rsi + offset]
-                    emit_mov_reg_mem(&jit, reg_low, RDI, offset);
-                    // Load high 64 bits: mov reg_high, qword ptr [rsi + offset + 8]
-                    emit_mov_reg_mem(&jit, reg_high, RDI, offset + 8);
-                    
-                    // Push both values on stack (low first, then high)
-                    jit.stack_regs[jit.stack_depth++] = reg_low;
-                    jit.stack_regs[jit.stack_depth++] = reg_high;
-                }
-                break;
-            }
-            
-            case VFM_PUSH128: {
-                // 128-bit immediate: 16 bytes (low 64 bits, then high 64 bits)
-                uint64_t low = *(uint64_t*)&program[pc];
-                uint64_t high = *(uint64_t*)&program[pc + 8];
-                pc += 16;
-                
-                uint8_t reg_low = alloc_reg(&jit);
-                uint8_t reg_high = alloc_reg(&jit);
-                
-                emit_mov_reg_imm64(&jit, reg_low, low);
-                emit_mov_reg_imm64(&jit, reg_high, high);
-                
-                // Push both values on stack (low first, then high)
-                jit.stack_regs[jit.stack_depth++] = reg_low;
-                jit.stack_regs[jit.stack_depth++] = reg_high;
-                break;
-            }
-            
-            case VFM_EQ128: {
-                if (jit.stack_depth >= 4) {
-                    // Pop two 128-bit values (4 64-bit registers total)
-                    uint8_t b_high = jit.stack_regs[--jit.stack_depth];
-                    uint8_t b_low = jit.stack_regs[--jit.stack_depth];
-                    uint8_t a_high = jit.stack_regs[--jit.stack_depth];
-                    uint8_t a_low = jit.stack_regs[--jit.stack_depth];
-                    
-                    uint8_t result_reg = alloc_reg(&jit);
-                    
-                    if (jit.use_avx2) {
-                        // AVX2 optimized version for Phase 2.2
-                        // Build 128-bit values in memory for vectorized comparison
-                        
-                        // Store first 128-bit value at [rsp-32]
-                        emit_mov_mem_reg(&jit, RSP, -16, a_low);   // Low 64 bits
-                        emit_mov_mem_reg(&jit, RSP, -8, a_high);   // High 64 bits
-                        
-                        // Store second 128-bit value at [rsp-16]  
-                        emit_mov_mem_reg(&jit, RSP, -32, b_low);   // Low 64 bits
-                        emit_mov_mem_reg(&jit, RSP, -24, b_high);  // High 64 bits
-                        
-                        // Intel/AMD specific instruction preferences for Phase 2.2
-                        if (jit.caps.vendor == CPU_VENDOR_INTEL) {
-                            // Intel prefers aligned loads when possible
-                            emit_vmovdqu_ymm_mem(&jit, YMM0, RSP, -32); // Load first value
-                            emit_vmovdqu_ymm_mem(&jit, YMM1, RSP, -16); // Load second value
-                            emit_vpcmpeqb_ymm(&jit, YMM2, YMM0, YMM1);  // Compare
-                        } else {
-                            // AMD and others: use standard sequence
-                            emit_vmovdqu_ymm_mem(&jit, YMM0, RSP, -32);
-                            emit_vmovdqu_ymm_mem(&jit, YMM1, RSP, -16);
-                            emit_vpcmpeqb_ymm(&jit, YMM2, YMM0, YMM1);
-                        }
-                        
-                        // Extract comparison result mask: VPMOVMSKB reg, YMM2
-                        emit_vpmovmskb_reg_ymm(&jit, result_reg, YMM2);
-                        
-                        // Check if all bytes are equal (mask == 0xFFFFFFFF for 32 bytes)
-                        emit_cmp_reg_imm32(&jit, result_reg, 0x0000FFFF); // Only first 16 bytes matter
-                        
-                        // Set result: 1 if equal, 0 if not equal
-                        emit_mov_reg_imm64(&jit, result_reg, 0);
-                        emit_sete_reg8(&jit, result_reg); // Set byte if equal
-                        
-                    } else {
-                        // Scalar fallback implementation
-                        // Compare low parts: cmp a_low, b_low
-                        emit_cmp_reg_reg(&jit, a_low, b_low);
-                        
-                        // Set result register to 0 initially
-                        emit_mov_reg_imm64(&jit, result_reg, 0);
-                        
-                        // Jump if low parts not equal
-                        emit_jne_rel32(&jit, 20); // Skip high comparison
-                        
-                        // Compare high parts: cmp a_high, b_high
-                        emit_cmp_reg_reg(&jit, a_high, b_high);
-                        
-                        // Jump if high parts not equal
-                        emit_jne_rel32(&jit, 8); // Skip setting result to 1
-                        
-                        // Set result to 1 (equal)
-                        emit_mov_reg_imm64(&jit, result_reg, 1);
-                    }
-                    
-                    // Free used registers
-                    free_reg(&jit, a_low); free_reg(&jit, a_high);
-                    free_reg(&jit, b_low); free_reg(&jit, b_high);
-                    
-                    // Push result
-                    jit.stack_regs[jit.stack_depth++] = result_reg;
-                }
-                break;
-            }
-            
+            // 128-bit opcodes are DECLINED. The interpreter models the 128-bit
+            // operand stack as two 64-bit slots pushed high-then-low and its
+            // EQ128 pops four slots and pushes a boolean; the previous x86
+            // emitters modelled this with an inconsistent slot order and, in the
+            // scalar EQ128 path, hard-coded relative jump displacements (jne +20,
+            // jne +8) that must exactly match the emitted instruction lengths --
+            // fragile, unverified, and not proven against the oracle. PUSH128 is
+            // already excluded by the jit_compatible pre-scan in vfm.c; LD128 and
+            // EQ128 reach here, so we decline them and let the interpreter (which
+            // implements the 128-bit semantics correctly) run the program.
+            case VFM_LD128:
+            case VFM_PUSH128:
+            case VFM_EQ128:
+                goto decline;
+
             case VFM_IPV6_EXT: {
-                uint8_t field_type = program[pc];
-                pc += 1;
-                (void)field_type; // Currently unused in JIT implementation
+                pc += 1;  // consume the field-type operand
 
                 // The JIT cannot correctly extract IPv6 extension-header
                 // fields (e.g. L4 ports walked past extension headers), so
@@ -1178,11 +1130,9 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 // IPv6 path. Previously this emitted a fragile runtime -1
                 // sentinel; a compile-time bail matches the default case and
                 // the stack-overflow precedent (PR #9).
-                free(jit.labels);
-                munmap(code, code_size);
-                return NULL;
+                goto decline;
             }
-            
+
             case VFM_RET: {
                 // Move return value to RAX
                 if (jit.stack_depth > 0) {
@@ -1204,12 +1154,8 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 // NULL so vfm_load_program leaves vm->cold.jit_code == NULL
                 // and execution falls back to the bounds-checked interpreter,
                 // which handles every opcode correctly. Identical shape to
-                // the merged stack-overflow bail above (PR #9). Return NULL
-                // directly rather than `goto done`: done: runs an mprotect we
-                // do not want and would free(jit.labels) a second time.
-                free(jit.labels);
-                munmap(code, code_size);
-                return NULL;
+                // the merged stack-overflow bail above (PR #9).
+                goto decline;
         }
     }
     
@@ -1219,14 +1165,24 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
     
 done:
     free(jit.labels);
-    
+
     // Make memory executable only (for security)
     if (mprotect(code, code_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(code, code_size);
         return NULL;
     }
-    
+
     return code;
+
+decline:
+    // Shared bail-out: an opcode this compiler cannot prove correct against the
+    // interpreter oracle (control flow, DIV, 128-bit ops), register exhaustion,
+    // or an unknown opcode. Release the partial page and labels and return NULL
+    // so vfm_load_program leaves jit_code == NULL and runs the interpreter. The
+    // `return code` above makes this label unreachable by fall-through.
+    free(jit.labels);
+    munmap(code, code_size);
+    return NULL;
 }
 
 // Phase 3.2.3: Adaptive x86_64 JIT compilation with packet pattern optimization
