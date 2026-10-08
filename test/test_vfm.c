@@ -6,8 +6,17 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #include "../include/vfm.h"
+
+// JIT compile entry points (compiled per host architecture; see Makefile).
+#ifdef __aarch64__
+extern void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
+extern bool vfm_jit_available_arm64(void);
+#elif defined(__x86_64__)
+extern void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len);
+#endif
 
 // Test framework macros
 #define TEST_ASSERT(condition) \
@@ -468,6 +477,155 @@ static int test_tcp_syn_filter(void) {
     return 0;
 }
 
+// Regression: the JIT must DECLINE (return NULL -> interpreter) for any
+// opcode it cannot correctly compile, instead of emitting a stub that
+// fabricates a wrong answer. This is a direct, entitlement-independent
+// discriminator: it calls the compile function directly and inspects the
+// returned pointer, so it is deterministic even on an unsigned test binary
+// where vfm_jit_available_arm64() is false and execution would otherwise
+// run the interpreter either way.
+//
+// Pre-fix behavior (the bug): the compile function returned a NON-NULL stub
+//   - arm64 default case emitted a truncated MOVZ of -1 (garbage return)
+//   - x86-64 default case emitted `mov RAX, 0` (silent DROP)
+// Post-fix: the compile function returns NULL and vfm_load_program falls
+// back to the correct bounds-checked interpreter.
+static int test_jit_declines_unsupported_opcode(void) {
+#ifdef __aarch64__
+    // A gate-passing program whose FIRST opcode (LD8 @ IPv4 proto offset 23)
+    // is NOT implemented by the arm64 JIT -> must bail to NULL.
+    // (= proto 6)-shaped: LD8@23, PUSH 6, JEQ accept, PUSH 0, RET, PUSH 1, RET
+    uint8_t unsupported[] = {
+        VFM_LD8, 23, 0x00,                                      // load proto byte
+        VFM_PUSH, 6, 0,0,0,0,0,0,0,                             // push 6 (TCP)
+        VFM_JEQ, 0x0A, 0x00,                                    // if equal -> accept (+10)
+        VFM_PUSH, 0, 0,0,0,0,0,0,0,                             // reject
+        VFM_RET,
+        VFM_PUSH, 1, 0,0,0,0,0,0,0,                             // accept
+        VFM_RET
+    };
+    // Pre-fix returned a non-NULL stub; post-fix returns NULL. This holds
+    // whether or not the JIT entitlement is present (if absent, the MAP_JIT
+    // mmap fails and the function also returns NULL).
+    void *bad = vfm_jit_compile_arm64(unsupported, sizeof(unsupported));
+    TEST_ASSERT(bad == NULL);
+
+    // An all-implemented program (PUSH, ADD, RET) must still compile to a
+    // real function pointer -- proving the working fast path is untouched.
+    // Guard on availability: without the entitlement the MAP_JIT mmap fails.
+    if (vfm_jit_available_arm64()) {
+        uint8_t supported[] = {
+            VFM_PUSH, 2, 0,0,0,0,0,0,0,                         // push 2
+            VFM_PUSH, 3, 0,0,0,0,0,0,0,                         // push 3
+            VFM_ADD,                                            // add
+            VFM_RET
+        };
+        void *good = vfm_jit_compile_arm64(supported, sizeof(supported));
+        TEST_ASSERT(good != NULL);
+        munmap(good, 4096);  // arm64 JIT uses a fixed 4096-byte page
+    }
+#elif defined(__x86_64__)
+    // VFM_JGE is emitted by the DSL for >= but is NOT implemented by the
+    // x86-64 JIT (only JEQ/JNE/JGT/JLT), so it hits the default case -> bail.
+    uint8_t unsupported[] = {
+        VFM_LD16, 36, 0x00,                                    // load dst port
+        VFM_PUSH, 0, 0,0,0,0,0,0,0,                            // push 0
+        VFM_JGE, 0x0A, 0x00,                                   // >= -> accept (+10)
+        VFM_PUSH, 0, 0,0,0,0,0,0,0,                            // reject
+        VFM_RET,
+        VFM_PUSH, 1, 0,0,0,0,0,0,0,                            // accept
+        VFM_RET
+    };
+    void *bad = vfm_jit_compile_x86_64(unsupported, sizeof(unsupported));
+    TEST_ASSERT(bad == NULL);
+
+    // An all-implemented program (LD16, PUSH, JEQ, RET) must still compile.
+    uint8_t supported[] = {
+        VFM_LD16, 36, 0x00,
+        VFM_PUSH, 80, 0,0,0,0,0,0,0,
+        VFM_JEQ, 0x0A, 0x00,
+        VFM_PUSH, 0, 0,0,0,0,0,0,0,
+        VFM_RET,
+        VFM_PUSH, 1, 0,0,0,0,0,0,0,
+        VFM_RET
+    };
+    void *good = vfm_jit_compile_x86_64(supported, sizeof(supported));
+    TEST_ASSERT(good != NULL);
+    munmap(good, sizeof(supported) * 32);  // x86-64 JIT uses len*32 bytes
+#else
+    printf("(no JIT backend for this arch - skipped) ");
+#endif
+    return 0;
+}
+
+// Regression (headline): a dst-port filter that SHOULD match must return a
+// nonzero (accept) result under the DEFAULT build. On Apple Silicon this
+// filter uses LD16 (load the 16-bit L4 port), an opcode the arm64 JIT does
+// not implement. Pre-fix, the arm64 JIT emitted a drop/garbage stub and this
+// filter matched ZERO packets silently. Post-fix, the JIT declines
+// (vm->cold.jit_code stays NULL) and the correct interpreter runs it.
+static int test_port_filter_matches_under_default_build(void) {
+    vfm_state_t *vm = vfm_create();
+    TEST_ASSERT(vm != NULL);
+
+    // (= dst-port 443): LD16@36, PUSH 443, JEQ accept(+10), PUSH 0, RET,
+    //                   PUSH 1, RET. Unique bytecode to avoid the global
+    //                   JIT cache returning a stale cross-test entry.
+    uint8_t program[] = {
+        VFM_LD16, 36, 0x00,                                    // load dst port (offset 36)
+        VFM_PUSH, 0xBB, 0x01, 0,0,0,0,0,0,                     // push 443 (0x01BB)
+        VFM_JEQ, 0x0A, 0x00,                                   // if equal -> accept (+10)
+        VFM_PUSH, 0, 0,0,0,0,0,0,0,                            // reject (drop)
+        VFM_RET,
+        VFM_PUSH, 1, 0,0,0,0,0,0,0,                            // accept
+        VFM_RET
+    };
+
+#ifdef __aarch64__
+    // Initialize the shared JIT cache so a successful JIT compile is actually
+    // INSTALLED into the VM. vfm_jit_cache_store() returns NULL when the cache
+    // is uninitialized, which would otherwise discard any compiled code and
+    // silently run the interpreter regardless -- masking the bug. The
+    // embedding application (PacketVelocity) initializes this cache, so this
+    // mirrors the real deployment in which the Apple Silicon silent-wrong-
+    // answer manifested. We destroy it again at the end of this test so the
+    // process-global cache does not leak into the other tests.
+    //
+    // Pre-fix on arm64: LD16 (load the 16-bit L4 port) is not implemented by
+    // the JIT, so the old default case emitted a garbage stub that WAS
+    // installed and executed -- returning a wrong answer / SIGILL, matching
+    // ZERO packets silently. Post-fix: the JIT declines (returns NULL),
+    // jit_code stays NULL, and the correct bounds-checked interpreter runs.
+    vfm_jit_cache_init(NULL);
+#endif
+
+    int rc = vfm_load_program(vm, program, sizeof(program));
+    TEST_ASSERT_EQ(VFM_SUCCESS, rc);
+
+#ifdef __aarch64__
+    // Post-fix the JIT must have declined this LD16-containing program.
+    TEST_ASSERT(vm->cold.jit_code == NULL);
+#endif
+
+    // Packet with dst port 443 at offset 36 -> MUST match (nonzero).
+    uint8_t packet[64];
+    memset(packet, 0, sizeof(packet));
+    packet[36] = 0x01; packet[37] = 0xBB;  // dst port 443, network order
+    int result = vfm_execute(vm, packet, sizeof(packet));
+    TEST_ASSERT_EQ(1, result);  // accept: nonzero match (FAILED pre-fix on arm64)
+
+    // Packet with a different dst port (80) -> must NOT match.
+    packet[36] = 0x00; packet[37] = 0x50;  // dst port 80
+    result = vfm_execute(vm, packet, sizeof(packet));
+    TEST_ASSERT_EQ(0, result);  // reject: no match
+
+    vfm_destroy(vm);
+#ifdef __aarch64__
+    vfm_jit_cache_destroy();  // restore process-global state for other tests
+#endif
+    return 0;
+}
+
 // Run all tests
 int main(void) {
     printf("VFM Unit Tests\n");
@@ -486,6 +644,8 @@ int main(void) {
     RUN_TEST(test_instruction_limit);
     RUN_TEST(test_division_by_zero);
     RUN_TEST(test_tcp_syn_filter);
+    RUN_TEST(test_jit_declines_unsupported_opcode);
+    RUN_TEST(test_port_filter_matches_under_default_build);
     RUN_TEST(test_performance);
     
     printf("\n==============\n");

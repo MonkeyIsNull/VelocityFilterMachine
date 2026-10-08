@@ -32,10 +32,16 @@ int main() {
     printf("\n2. Testing basic JIT compilation...\n");
     
     // Simple program: PUSH 42, RET
+    // NOTE: use the VFM_* enum values rather than magic bytes. The literal
+    // 0x16 previously used here is VFM_JLT, not VFM_RET (which is 0x17), so
+    // this program actually terminated in an unimplemented opcode and only
+    // "compiled" because the old JIT default case emitted a non-NULL stub.
+    // Both VFM_PUSH and VFM_RET are implemented by the JIT, so this program
+    // never hits the default case and must compile to a real function.
     uint8_t program[] = {
-        0x04,  // VFM_PUSH
+        VFM_PUSH,                                        // push immediate
         0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 42 (64-bit)
-        0x16   // VFM_RET
+        VFM_RET                                          // return top of stack
     };
     
     extern void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
