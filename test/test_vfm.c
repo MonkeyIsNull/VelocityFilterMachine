@@ -525,8 +525,14 @@ static int test_jit_declines_unsupported_opcode(void) {
         munmap(good, 4096);  // arm64 JIT uses a fixed 4096-byte page
     }
 #elif defined(__x86_64__)
-    // VFM_JGE is emitted by the DSL for >= but is NOT implemented by the
-    // x86-64 JIT (only JEQ/JNE/JGT/JLT), so it hits the default case -> bail.
+    // Control flow is NOT compiled by the x86-64 single-core JIT: the old branch
+    // emitters used a bogus `vfm_offset * 16` displacement (and signed jumps for
+    // the interpreter's unsigned compares), so every branch targeted an
+    // arbitrary address. A correct VFM-pc -> x86-offset fixup pass is not
+    // implemented, so any branch (JGE here, and likewise JEQ/JNE/JGT/JLT/JMP)
+    // DECLINES to the interpreter -- exactly the #10/#11 "never emit code we
+    // cannot prove against the oracle" discipline. This mirrors the ARM64 half
+    // of this test, where a branch program is the unsupported example.
     uint8_t unsupported[] = {
         VFM_LD16, 36, 0x00,                                    // load dst port
         VFM_PUSH, 0, 0,0,0,0,0,0,0,                            // push 0
@@ -539,14 +545,13 @@ static int test_jit_declines_unsupported_opcode(void) {
     void *bad = vfm_jit_compile_x86_64(unsupported, sizeof(unsupported));
     TEST_ASSERT(bad == NULL);
 
-    // An all-implemented program (LD16, PUSH, JEQ, RET) must still compile.
+    // A program built only from oracle-validated x86 emitters (LD16, PUSH,
+    // ADD, RET) must still compile to a real function pointer -- proving the
+    // working fast path is untouched.
     uint8_t supported[] = {
-        VFM_LD16, 36, 0x00,
-        VFM_PUSH, 80, 0,0,0,0,0,0,0,
-        VFM_JEQ, 0x0A, 0x00,
-        VFM_PUSH, 0, 0,0,0,0,0,0,0,
-        VFM_RET,
-        VFM_PUSH, 1, 0,0,0,0,0,0,0,
+        VFM_LD16, 36, 0x00,                                    // load dst port
+        VFM_PUSH, 80, 0,0,0,0,0,0,0,                           // push 80
+        VFM_ADD,                                               // add
         VFM_RET
     };
     void *good = vfm_jit_compile_x86_64(supported, sizeof(supported));
