@@ -704,20 +704,35 @@ void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
             }
             
             default:
-                // Unsupported instruction - fall back to interpreter
-                emit_mov_imm(&jit, ARM64_X0, -1);  // Return error
-                
-                // Flush scheduled instructions and cleanup before fallback
-                flush_scheduler(&scheduler, &jit);
+                // Unsupported instruction - this opcode cannot be correctly
+                // compiled by the ARM64 JIT. Rather than emit a stub that
+                // fabricates a result (the old code emitted a truncated
+                // MOVZ of -1 that returned garbage, silently dropping or
+                // mis-matching packets), clean up all partially allocated
+                // JIT state and return NULL. vfm_load_program leaves
+                // vm->cold.jit_code == NULL on a NULL compile, so execution
+                // transparently falls back to the bounds-checked interpreter,
+                // which handles every opcode correctly. This mirrors the
+                // x86-64 stack-overflow bail precedent (PR #9).
+                //
+                // Use free_scheduler (NOT flush_scheduler): the buffered
+                // instructions must be discarded with the page, not emitted
+                // into it. init_scheduler malloc'd both sched->instructions
+                // and sched->dependency_map; free_scheduler frees both.
                 free_scheduler(&scheduler);
-                
-                emit_epilogue(&jit);
-                
-                if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
-                    return NULL;
-                }
-                
-                return jit.code;
+#ifdef __APPLE__
+                // Re-enable W^X write protection that the compile entry
+                // disabled via pthread_jit_write_protect_np(0). The bail
+                // skips flush_and_protect_memory (the only other re-enabler),
+                // so without this the MAP_JIT pages are left writable (not
+                // executable) for this thread -- the toggle is thread-global
+                // and a later JIT execute/compile on the same thread could
+                // fault. Must stay inside __APPLE__: the non-Apple ARM64 path
+                // maps RWX and never calls this intrinsic.
+                pthread_jit_write_protect_np(1);
+#endif
+                munmap(code, code_size);
+                return NULL;
         }
     }
     

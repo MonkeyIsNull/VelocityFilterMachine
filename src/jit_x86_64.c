@@ -1167,12 +1167,20 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
                 uint8_t field_type = program[pc];
                 pc += 1;
                 (void)field_type; // Currently unused in JIT implementation
-                
-                // For now, fall back to interpreter for IPv6 extension fields
-                // This is complex to implement in JIT, so we emit a call to interpreter
-                emit_mov_reg_imm64(&jit, RAX, -1); // Return error - fall back to interpreter
-                emit_epilogue(&jit);
-                goto done;
+
+                // The JIT cannot correctly extract IPv6 extension-header
+                // fields (e.g. L4 ports walked past extension headers), so
+                // clean up and bail to the bounds-checked interpreter, which
+                // implements this correctly. This is effectively unreachable
+                // via vfm_load_program today -- VFM_IPV6_EXT is blocklisted in
+                // the jit_compatible pre-scan (src/vfm.c) -- so this is a
+                // robustness/consistency change, not an alteration of the
+                // IPv6 path. Previously this emitted a fragile runtime -1
+                // sentinel; a compile-time bail matches the default case and
+                // the stack-overflow precedent (PR #9).
+                free(jit.labels);
+                munmap(code, code_size);
+                return NULL;
             }
             
             case VFM_RET: {
@@ -1189,10 +1197,19 @@ void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len) {
             }
             
             default:
-                // Unknown instruction - emit return 0
-                emit_mov_reg_imm64(&jit, RAX, 0);
-                emit_epilogue(&jit);
-                goto done;
+                // This opcode cannot be correctly compiled by the x86-64
+                // JIT. The old code emitted `mov RAX, 0` + epilogue, which
+                // silently returned 0 (DROP) for every packet -- a silent
+                // wrong answer. Instead, clean up partial state and return
+                // NULL so vfm_load_program leaves vm->cold.jit_code == NULL
+                // and execution falls back to the bounds-checked interpreter,
+                // which handles every opcode correctly. Identical shape to
+                // the merged stack-overflow bail above (PR #9). Return NULL
+                // directly rather than `goto done`: done: runs an mprotect we
+                // do not want and would free(jit.labels) a second time.
+                free(jit.labels);
+                munmap(code, code_size);
+                return NULL;
         }
     }
     
