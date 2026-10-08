@@ -94,8 +94,20 @@ TOOLS = $(TOOL_SRCS:.c=)
 VFLISPC = $(VFLISP_DIR)/vflispc
 
 # Test sources
-TEST_SRCS = $(TEST_DIR)/test_vfm.c $(TEST_DIR)/jit_test.c
+TEST_SRCS = $(TEST_DIR)/test_vfm.c $(TEST_DIR)/jit_test.c $(TEST_DIR)/test_multicore.c
 TEST_BINS = $(TEST_SRCS:.c=)
+
+# Sources needed to build sanitizer test binaries directly (no static lib, so
+# the sanitizer instruments the library too).
+SAN_SRCS = $(SRC_DIR)/vfm.c $(SRC_DIR)/vfm_jit_cache.c $(SRC_DIR)/verifier.c \
+           $(SRC_DIR)/compiler.c $(SRC_DIR)/stubs.c \
+           $(VFLISP_DIR)/vflisp_parser.c $(VFLISP_DIR)/vflisp_compile.c \
+           $(VFLISP_DIR)/vflisp_util.c
+ifeq ($(UNAME_M),x86_64)
+    SAN_SRCS += $(SRC_DIR)/jit_x86_64.c
+else ifneq ($(filter $(UNAME_M),aarch64 arm64),)
+    SAN_SRCS += $(SRC_DIR)/jit_arm64.c
+endif
 
 # Benchmark sources
 BENCH_SRCS = $(BENCH_DIR)/bench.c
@@ -158,6 +170,9 @@ test: $(TEST_BINS)
 	@echo ""
 	@echo "=== Running VFM JIT tests ==="
 	./$(TEST_DIR)/jit_test
+	@echo ""
+	@echo "=== Running VFM multicore tests ==="
+	./$(TEST_DIR)/test_multicore
 
 $(TEST_DIR)/test_vfm: $(TEST_DIR)/test_vfm.c libvfm.a
 	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
@@ -166,11 +181,65 @@ ifeq ($(UNAME_S),Darwin)
 	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
 endif
 
+# jit_test and test_multicore are JIT-CRITICAL: without the JIT entitlement,
+# MAP_JIT silently yields an interpreter-only run and the tests cannot validate
+# the JIT. We therefore sign with the ad-hoc fallback identity (SIGNING_IDENTITY
+# becomes "-" when no Developer ID is found) and DO NOT swallow failure with
+# `|| true` -- an unsigned JIT-critical binary must fail the build loudly.
 $(TEST_DIR)/jit_test: $(TEST_DIR)/jit_test.c libvfm.a
 	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
 ifeq ($(UNAME_S),Darwin)
-	@echo "Code signing $@ for JIT support..."
-	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@ || true
+	@echo "Code signing $@ for JIT support (JIT-critical, no || true)..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@
+endif
+
+$(TEST_DIR)/test_multicore: $(TEST_DIR)/test_multicore.c libvfm.a
+	$(CC) $(CFLAGS) $(TEST_FLAGS) $< -o $@ -L. -lvfm $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	@echo "Code signing $@ for JIT support (JIT-critical, no || true)..."
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@
+endif
+
+# Sanitizer test targets for the multicore subsystem.
+#   asan: JIT ENABLED -- exercises the recompile lifecycle (swap-on-success,
+#         free-old-with-captured-size, declined recompile, borrowed-page teardown).
+#   tsan: JIT DISABLED (VFM_TSAN_NO_JIT) -- TSan cannot instrument RX MAP_JIT
+#         pages; this validates the barrier/completed_count/generation/
+#         publication ordering and per-core stats.
+.PHONY: test-asan test-tsan test-jit-asan
+test-asan: $(TEST_DIR)/test_multicore_asan
+	@echo "=== Running multicore tests under AddressSanitizer (JIT on) ==="
+	ASAN_OPTIONS=detect_leaks=0 ./$(TEST_DIR)/test_multicore_asan
+
+test-tsan: $(TEST_DIR)/test_multicore_tsan
+	@echo "=== Running multicore tests under ThreadSanitizer (JIT off) ==="
+	./$(TEST_DIR)/test_multicore_tsan
+
+# jit-asan: JIT ENABLED -- exercises the single-core JIT cache teardown path
+# (compile+store, cache-hit sharing, and the release/free ordering in
+# vfm_destroy / vfm_load_program). Deterministically catches the cache-owned
+# page UAF: the pre-fix teardown munmap'd a shared page, so the cache-hit VM
+# executed freed memory and ASan reported SEGV.
+test-jit-asan: $(TEST_DIR)/jit_test_asan
+	@echo "=== Running JIT tests under AddressSanitizer (JIT on) ==="
+	ASAN_OPTIONS=detect_leaks=0 ./$(TEST_DIR)/jit_test_asan
+
+$(TEST_DIR)/test_multicore_asan: $(TEST_DIR)/test_multicore.c $(SAN_SRCS)
+	$(CC) -fsanitize=address -g -O1 -I./include -I./src $(TEST_FLAGS) $^ -o $@ $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@
+endif
+
+$(TEST_DIR)/test_multicore_tsan: $(TEST_DIR)/test_multicore.c $(SAN_SRCS)
+	$(CC) -fsanitize=thread -DVFM_TSAN_NO_JIT -g -O1 -I./include -I./src $(TEST_FLAGS) $^ -o $@ $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@
+endif
+
+$(TEST_DIR)/jit_test_asan: $(TEST_DIR)/jit_test.c $(SAN_SRCS)
+	$(CC) -fsanitize=address -g -O1 -I./include -I./src $(TEST_FLAGS) $^ -o $@ $(LDFLAGS)
+ifeq ($(UNAME_S),Darwin)
+	$(CODESIGN) --entitlements $(ENTITLEMENTS) -s "$(SIGNING_IDENTITY)" $@
 endif
 
 # Benchmarks
@@ -194,6 +263,8 @@ clean:
 	rm -f $(TOOLS)
 	rm -f $(VFLISP_OBJS) $(VFLISPC)
 	rm -f $(TEST_BINS)
+	rm -f $(TEST_DIR)/test_multicore_asan $(TEST_DIR)/test_multicore_tsan
+	rm -f $(TEST_DIR)/jit_test_asan
 	rm -f $(BENCH_BINS)
 
 # Install (optional)

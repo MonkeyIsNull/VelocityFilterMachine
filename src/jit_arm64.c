@@ -83,7 +83,7 @@ static void emit_sub_imm(vfm_jit_arm64_t *jit, int rd, int rn, int imm) {
 }
 
 // Emit UMOV (extract vector element to general register)
-static void emit_umov_x(vfm_jit_arm64_t *jit, int rd, int vn, int index) {
+static void __attribute__((unused)) emit_umov_x(vfm_jit_arm64_t *jit, int rd, int vn, int index) {
     // UMOV Xd, Vn.D[index] - extract 64-bit element to X register
     uint32_t insn = 0x4e083c00 | ((index & 1) << 20) | (vn << 5) | rd;
     emit_u32(jit, insn);
@@ -91,14 +91,14 @@ static void emit_umov_x(vfm_jit_arm64_t *jit, int rd, int vn, int index) {
 
 
 // Emit LDR immediate
-static void emit_ldr_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
+static void __attribute__((unused)) emit_ldr_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
     // LDR Xt, [Xn, #imm]
     uint32_t insn = 0xf9400000 | ((imm >> 3) << 10) | (rn << 5) | rt;
     emit_u32(jit, insn);
 }
 
 // Emit STR immediate
-static void emit_str_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
+static void __attribute__((unused)) emit_str_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
     // STR Xt, [Xn, #imm]
     uint32_t insn = 0xf9000000 | ((imm >> 3) << 10) | (rn << 5) | rt;
     emit_u32(jit, insn);
@@ -108,6 +108,47 @@ static void emit_str_imm(vfm_jit_arm64_t *jit, int rt, int rn, int imm) {
 static void emit_ret(vfm_jit_arm64_t *jit) {
     // RET X30
     emit_u32(jit, 0xd65f03c0);
+}
+
+// Emit MOV (register): ORR Xd, XZR, Xm
+static void emit_mov_reg(vfm_jit_arm64_t *jit, int rd, int rm) {
+    emit_u32(jit, 0xaa0003e0 | (rm << 16) | rd);
+}
+
+// Emit a full 64-bit immediate via MOVZ + up to three MOVK (16-bit chunks).
+// The old emit_mov_imm emitted a single MOVZ and silently truncated any
+// value above 0xFFFF, so PUSH of a large immediate did not match the
+// interpreter. This covers the whole 64-bit range.
+static void emit_mov_imm64(vfm_jit_arm64_t *jit, int rd, uint64_t imm) {
+    // MOVZ Xd, #imm[15:0]
+    emit_u32(jit, 0xd2800000 | (uint32_t)((imm & 0xFFFF) << 5) | rd);
+    // MOVK Xd, #imm[31:16], LSL #16
+    if ((imm >> 16) & 0xFFFF) {
+        emit_u32(jit, 0xf2a00000 | (uint32_t)(((imm >> 16) & 0xFFFF) << 5) | rd);
+    }
+    // MOVK Xd, #imm[47:32], LSL #32
+    if ((imm >> 32) & 0xFFFF) {
+        emit_u32(jit, 0xf2c00000 | (uint32_t)(((imm >> 32) & 0xFFFF) << 5) | rd);
+    }
+    // MOVK Xd, #imm[63:48], LSL #48
+    if ((imm >> 48) & 0xFFFF) {
+        emit_u32(jit, 0xf2e00000 | (uint32_t)(((imm >> 48) & 0xFFFF) << 5) | rd);
+    }
+}
+
+// Emit ADD Xd, Xn, #imm12
+static void emit_add_imm(vfm_jit_arm64_t *jit, int rd, int rn, int imm) {
+    emit_u32(jit, 0x91000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd);
+}
+
+// Emit STR Xt, [Xn, Xm, LSL #3] (64-bit, scaled register offset)
+static void emit_str_reg_x(vfm_jit_arm64_t *jit, int rt, int rn, int rm) {
+    emit_u32(jit, 0xf8207800 | (rm << 16) | (rn << 5) | rt);
+}
+
+// Emit LDR Xt, [Xn, Xm, LSL #3] (64-bit, scaled register offset)
+static void emit_ldr_reg_x(vfm_jit_arm64_t *jit, int rt, int rn, int rm) {
+    emit_u32(jit, 0xf8607800 | (rm << 16) | (rn << 5) | rt);
 }
 
 // Emit NEON 128-bit load (LDR Qd, [Xn, #imm])
@@ -129,7 +170,7 @@ static void emit_str_q_imm(vfm_jit_arm64_t *jit, int qt, int rn, int imm) {
 }
 
 // Emit NEON 128-bit comparison (CMEQ Vd.16B, Vn.16B, Vm.16B)
-static void emit_cmeq_v16b(vfm_jit_arm64_t *jit, int vd, int vn, int vm) {
+static void __attribute__((unused)) emit_cmeq_v16b(vfm_jit_arm64_t *jit, int vd, int vn, int vm) {
     // CMEQ Vd.16B, Vn.16B, Vm.16B - Compare equal (128-bit vectors)
     uint32_t insn = 0x6e208c00 | (vm << 16) | (vn << 5) | vd;
     emit_u32(jit, insn);
@@ -137,28 +178,28 @@ static void emit_cmeq_v16b(vfm_jit_arm64_t *jit, int vd, int vn, int vm) {
 
 
 // Emit ADDV to efficiently reduce vector to scalar (single instruction)
-static void emit_addv_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
+static void __attribute__((unused)) emit_addv_v16b(vfm_jit_arm64_t *jit, int vd, int vn) {
     // ADDV Bd, Vn.16B - sum all 16 bytes to single byte in Bd
     uint32_t insn = 0x4e31b800 | (vn << 5) | vd;
     emit_u32(jit, insn);
 }
 
 // Emit scaled load for 128-bit stack access (single instruction)
-static void emit_ldr_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
+static void __attribute__((unused)) emit_ldr_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
     // LDR Qd, [Xbase, Xindex, LSL #4] - load with scaled index
     uint32_t insn = 0x3cc00000 | (1 << 12) | (index << 16) | (base << 5) | qt;
     emit_u32(jit, insn);
 }
 
 // Emit scaled store for 128-bit stack access (single instruction)
-static void emit_str_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
+static void __attribute__((unused)) emit_str_q_scaled(vfm_jit_arm64_t *jit, int qt, int base, int index) {
     // STR Qd, [Xbase, Xindex, LSL #4] - store with scaled index
     uint32_t insn = 0x3c800000 | (1 << 12) | (index << 16) | (base << 5) | qt;
     emit_u32(jit, insn);
 }
 
 // Emit prefetch instruction for memory optimization
-static void emit_prfm(vfm_jit_arm64_t *jit, int type, int rn, int offset) {
+static void __attribute__((unused)) emit_prfm(vfm_jit_arm64_t *jit, int type, int rn, int offset) {
     // PRFM type, [Xn, #offset] - prefetch memory
     // Type: 0=PLDL1KEEP, 1=PLDL1STRM, 2=PLDL2KEEP, 3=PLDL2STRM
     uint32_t insn = 0xf9800000 | (type << 0) | ((offset >> 3) << 10) | (rn << 5);
@@ -360,7 +401,7 @@ static void emit_stp_q(vfm_jit_arm64_t *jit, int qt1, int qt2, int rn, int imm) 
 // Optimized bulk stack operations using NEON parallelism
 
 // Bulk load multiple 128-bit values from stack (2 at a time for better bandwidth)
-static void emit_bulk_stack128_load(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
+static void __attribute__((unused)) emit_bulk_stack128_load(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
     // Load 'count' 128-bit values using LDP instructions for optimal memory bandwidth
     // Uses Q0-Q7 as temporary registers
     int pairs = count / 2;
@@ -380,7 +421,7 @@ static void emit_bulk_stack128_load(vfm_jit_arm64_t *jit, int count, int base_re
 }
 
 // Bulk store multiple 128-bit values to stack (2 at a time for better bandwidth)
-static void emit_bulk_stack128_store(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
+static void __attribute__((unused)) emit_bulk_stack128_store(vfm_jit_arm64_t *jit, int count, int base_reg, int offset) {
     // Store 'count' 128-bit values using STP instructions for optimal memory bandwidth
     // Uses Q0-Q7 as source registers
     int pairs = count / 2;
@@ -459,297 +500,148 @@ static bool flush_and_protect_memory(uint8_t *code, size_t code_pos, size_t code
     return true;
 }
 
-// JIT compile for ARM64
-void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
+// ============================================================================
+// Shared per-opcode emitters (one source of truth for single-core and adaptive)
+//
+// Calling convention (see vfm_jit_execute in vfm.c), identical on every arch:
+//   uint64_t fn(const uint8_t *packet, uint16_t packet_len,
+//               uint64_t *stack64, vfm_u128_t *stack128)
+// AArch64 argument registers: X0=packet, X1=len, X2=stack64, X3=stack128.
+//
+// Register map inside compiled code:
+//   X0  = packet base (arg0)       X1  = packet length (arg1)
+//   X21 = stack64 base (from X2)   X23 = stack128 base (from X3)
+//   X19 = sp  (64-bit stack index, starts at 0)
+//   X22 = sp128 (128-bit stack index, starts at 0)
+//   X3, X4 = scratch
+//
+// Stack discipline mirrors the interpreter exactly (vfm.c STACK_PUSH/POP):
+// sp starts at 0, slot 0 is the empty sentinel, PUSH does stack[++sp]=v,
+// POP returns stack[sp--], RET returns stack[sp].
+// ============================================================================
+
+// Establish the VM register map from the incoming argument registers.
+// NOTE: this does NOT dereference any struct -- the stack bases arrive as
+// explicit pointer arguments, so one compiled page is valid for the single
+// VM and for every worker thread's per-core VM simultaneously.
+static void emit_vm_setup(vfm_jit_arm64_t *jit) {
+    emit_mov_reg(jit, ARM64_X21, ARM64_X2);   // stack64 base
+    emit_mov_reg(jit, ARM64_X23, ARM64_X3);   // stack128 base
+    emit_mov_imm(jit, ARM64_X19, 0);          // sp   = 0
+    emit_mov_imm(jit, ARM64_X22, 0);          // sp128 = 0
+}
+
+// PUSH imm64 : stack[++sp] = imm
+static void emit_op_push(vfm_jit_arm64_t *jit, uint64_t imm) {
+    emit_mov_imm64(jit, ARM64_X3, imm);
+    emit_add_imm(jit, ARM64_X19, ARM64_X19, 1);      // sp++
+    emit_str_reg_x(jit, ARM64_X3, ARM64_X21, ARM64_X19); // stack[sp] = imm
+}
+
+// ADD : b=stack[sp]; a=stack[sp-1]; stack[sp-1]=a+b; sp--
+static void emit_op_add(vfm_jit_arm64_t *jit) {
+    emit_ldr_reg_x(jit, ARM64_X3, ARM64_X21, ARM64_X19); // b = stack[sp]
+    emit_sub_imm(jit, ARM64_X19, ARM64_X19, 1);          // sp--
+    emit_ldr_reg_x(jit, ARM64_X4, ARM64_X21, ARM64_X19); // a = stack[sp-1]
+    emit_add_reg(jit, ARM64_X4, ARM64_X4, ARM64_X3);     // a + b
+    emit_str_reg_x(jit, ARM64_X4, ARM64_X21, ARM64_X19); // stack[sp-1] = a+b
+}
+
+// RET : return stack[sp] in X0
+static void emit_op_ret(vfm_jit_arm64_t *jit) {
+    emit_ldr_reg_x(jit, ARM64_X0, ARM64_X21, ARM64_X19);
+    emit_epilogue(jit);
+}
+
+// Shared compile core. Single-core and adaptive run the SAME loop, the SAME
+// prologue/ABI, the SAME per-opcode emitters and the SAME decline-and-clean-up
+// bail path. `profile` is advisory only (prefetch/scheduling hints) and may
+// NEVER change instruction semantics; it is currently unused because the
+// trusted emitter set (PUSH/ADD/RET) has no profile-tunable form. Any opcode
+// outside that set hits the decline path: free all partial state, re-enable
+// W^X, munmap, return NULL -- the caller then falls back to the interpreter.
+static void* vfm_jit_compile_arm64_impl(const uint8_t *program, uint32_t len,
+                                        vfm_execution_profile_t *profile) {
+    (void)profile;
     size_t code_size = 4096;
-    
+
 #ifdef __APPLE__
-    // On Apple Silicon, use MAP_JIT for JIT compilation
-    uint8_t *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE, 
+    uint8_t *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 #else
-    // On other ARM64 systems, use traditional RWX mapping
     uint8_t *code = mmap(NULL, code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
-    
     if (code == MAP_FAILED) {
         return NULL;
     }
-    
-    vfm_jit_arm64_t jit = {
-        .code = code,
-        .code_size = code_size,
-        .code_pos = 0
-    };
-    
-    // Initialize ARM64 instruction scheduler for Phase 2.1.4 optimizations
+
+    vfm_jit_arm64_t jit = { .code = code, .code_size = code_size, .code_pos = 0 };
+
     arm64_scheduler_t scheduler;
-    init_scheduler(&scheduler, 16);  // Buffer up to 16 instructions for scheduling
-    
+    init_scheduler(&scheduler, 16);
+
 #ifdef __APPLE__
-    // On Apple Silicon, disable write protection before generating JIT code
-    // This is REQUIRED - without this call, hardened runtime may prevent
-    // writing instructions to the allocated MAP_JIT pages
+    // Disable W^X write protection for this thread before writing the MAP_JIT
+    // page. The toggle is thread-local and must be re-enabled on every exit
+    // path (success via flush_and_protect_memory, bail via the label below).
     pthread_jit_write_protect_np(0);
 #endif
-    
+
     emit_prologue(&jit);
-    
-    // Register allocation:
-    // X0 = VM state pointer
-    // X1 = Packet pointer
-    // X2 = Packet length
-    // X19 = Stack pointer (VM)
-    // X20 = Program counter
-    // X21 = Stack base pointer
-    // X22 = 128-bit stack pointer
-    // X23 = 128-bit stack base pointer
-    // Q0-Q7 = NEON 128-bit registers for IPv6 operations
-    
-    // Initialize VM registers
-    emit_ldr_imm(&jit, ARM64_X21, ARM64_X0, 8);  // Load stack pointer
-    emit_mov_imm(&jit, ARM64_X19, 0);            // Initialize SP
-    emit_mov_imm(&jit, ARM64_X20, 0);            // Initialize PC
-    
-    // Initialize 128-bit stack registers
-    emit_ldr_imm(&jit, ARM64_X23, ARM64_X0, 160); // Load 128-bit stack base (stack128 field offset)
-    emit_ldr_imm(&jit, ARM64_X22, ARM64_X0, 172); // Load current sp128 value (sp128 field offset)
-    
-    // Compile instructions
+    emit_vm_setup(&jit);
+
     for (uint32_t pc = 0; pc < len; ) {
         uint8_t opcode = program[pc++];
-        
+
         switch (opcode) {
             case VFM_PUSH: {
                 uint64_t imm = *(uint64_t*)&program[pc];
                 pc += 8;
-                
-                // Load immediate into X3
-                emit_mov_imm(&jit, ARM64_X3, imm & 0xFFFF);
-                
-                // Store to stack: stack[++sp] = imm
-                emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X1);  // sp++
-                emit_str_imm(&jit, ARM64_X3, ARM64_X21, 0);          // stack[sp] = imm
+                emit_op_push(&jit, imm);
                 break;
             }
-            
+
             case VFM_ADD: {
-                // Pop two values and add them
-                emit_ldr_imm(&jit, ARM64_X2, ARM64_X21, 0);          // b = stack[sp]
-                emit_ldr_imm(&jit, ARM64_X3, ARM64_X21, -8);         // a = stack[sp-1]
-                emit_add_reg(&jit, ARM64_X3, ARM64_X3, ARM64_X2);    // a + b
-                emit_str_imm(&jit, ARM64_X3, ARM64_X21, -8);         // stack[sp-1] = result
-                // sp-- (decrement stack pointer)
+                emit_op_add(&jit);
                 break;
             }
-            
-            case VFM_LD128: {
-                // Optimized 128-bit load from packet (IPv6 address) with prefetching
-                uint16_t offset = *(uint16_t*)&program[pc];
-                pc += 2;
-                
-                // Calculate packet address with bounds check
-                emit_mov_imm(&jit, ARM64_X3, offset);             // Load offset into X3
-                emit_add_reg(&jit, ARM64_X3, ARM64_X1, ARM64_X3); // packet + offset  
-                // TODO: Add proper bounds checking for offset + 16 > packet_len
-                
-                // Prefetch potential next IPv6 data for cache optimization
-                emit_prfm(&jit, 0, ARM64_X3, 64);                 // PLDL1KEEP [X3, #64]
-                
-                // Load 128-bit value into Q0 from packet[offset] 
-                emit_ldr_q_imm(&jit, ARM64_Q0, ARM64_X3, 0);
-                
-                // Push to 128-bit stack using optimized scaled store
-                emit_mov_imm(&jit, ARM64_X4, 1);                   // Increment value
-                emit_add_reg(&jit, ARM64_X22, ARM64_X22, ARM64_X4); // sp128++
-                emit_str_q_scaled(&jit, ARM64_Q0, ARM64_X23, ARM64_X22); // stack128[sp128] = Q0
-                break;
-            }
-            
-            case VFM_EQ128: {
-                // Optimized 128-bit comparison with NEON vectorized operations and instruction scheduling
-                
-                // Use scheduler to optimize instruction ordering for ARM64 pipeline
-                // Interleave independent operations to maximize superscalar execution
-                
-                // Use instruction scheduling for optimal ARM64 pipeline utilization (Phase 2.1.4)
-                // Demonstrate scheduling by properly ordering independent operations
-                
-                // Step 1: Load operands with optimized address calculations
-                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128-- (for second operand)
-                emit_ldr_q_scaled(&jit, ARM64_Q1, ARM64_X23, ARM64_X22); // Q1 = stack128[sp128] (top)
-                
-                emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 1);       // sp128-- (for first operand)  
-                emit_ldr_q_scaled(&jit, ARM64_Q0, ARM64_X23, ARM64_X22); // Q0 = stack128[sp128-1] (second)
-                
-                // Step 3: NEON operations (use ASIMD pipeline)
-                emit_cmeq_v16b(&jit, ARM64_Q2, ARM64_Q0, ARM64_Q1);
-                emit_addv_v16b(&jit, ARM64_Q3, ARM64_Q2);          // Sum all 16 bytes into B3
-                
-                // Step 4: Integer pipeline operations (can overlap with final NEON completion)
-                emit_umov_x(&jit, ARM64_X3, ARM64_Q3, 0);          // Extract summed byte to X3
-                emit_mov_imm(&jit, ARM64_X4, 4080);               // Expected value for all equal
-                
-                // Step 5: Comparison and conditional operations
-                emit_u32(&jit, 0xeb04007f);                       // CMP X3, X4
-                emit_u32(&jit, 0x9a9f0063);                       // CSET X3, EQ
-                
-                // Step 6: Stack operations (final result storage)
-                emit_mov_imm(&jit, ARM64_X4, 1);                  // Prepare increment
-                emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X4); // sp++ (increment stack pointer)
-                emit_str_imm(&jit, ARM64_X3, ARM64_X21, 0);       // stack[sp] = result
-                break;
-            }
-            
-            // New optimized operations using NEON parallel load/store
-            
-            case VFM_BULK_LOAD128: {
-                // Bulk load multiple 128-bit values using NEON LDP for optimal bandwidth
-                uint8_t count = program[pc++];  // Number of 128-bit values to load
-                uint16_t offset = *(uint16_t*)&program[pc]; // Starting packet offset
-                pc += 2;
-                
-                if (count > 8) count = 8;  // Limit to available Q-registers
-                
-                // Calculate packet address
-                emit_mov_imm(&jit, ARM64_X3, offset);
-                emit_add_reg(&jit, ARM64_X3, ARM64_X1, ARM64_X3); // packet + offset
-                
-                // Prefetch multiple cache lines for bulk access
-                for (int i = 0; i < (count + 3) / 4; i++) {
-                    emit_prfm(&jit, 0, ARM64_X3, i * 64); // PLDL1KEEP every 64 bytes
-                }
-                
-                // Use bulk load function with NEON parallelism
-                emit_bulk_stack128_load(&jit, count, ARM64_X3, 0);
-                
-                // Update 128-bit stack pointer (sp128 += count)
-                emit_mov_imm(&jit, ARM64_X4, count);
-                emit_add_reg(&jit, ARM64_X22, ARM64_X22, ARM64_X4);
-                
-                // Store loaded values to 128-bit stack using bulk store
-                emit_bulk_stack128_store(&jit, count, ARM64_X23, 
-                    (int)((count - 1) * -16)); // Negative offset to store at stack top
-                break;
-            }
-            
-            case VFM_PARALLEL_EQ128: {
-                // Parallel comparison of multiple 128-bit values using NEON LDP
-                uint8_t count = program[pc++];  // Number of pairs to compare
-                
-                if (count > 4) count = 4;  // Limit to available Q-register pairs
-                
-                // Load pairs of 128-bit values from stack using LDP for bandwidth
-                for (int i = 0; i < count; i++) {
-                    // Load pair (2 values) for comparison
-                    emit_sub_imm(&jit, ARM64_X22, ARM64_X22, 2); // sp128 -= 2
-                    emit_ldp_q(&jit, ARM64_Q0 + i*2, ARM64_Q1 + i*2, ARM64_X23, 
-                        (int)(ARM64_X22 * 16)); // Load pair from stack
-                    
-                    // Vectorized comparison
-                    emit_cmeq_v16b(&jit, ARM64_Q4 + i, ARM64_Q0 + i*2, ARM64_Q1 + i*2);
-                    
-                    // Reduce to scalar
-                    emit_addv_v16b(&jit, ARM64_Q4 + i, ARM64_Q4 + i);
-                }
-                
-                // Combine results and push to 64-bit stack
-                for (int i = 0; i < count; i++) {
-                    emit_umov_x(&jit, ARM64_X3 + i, ARM64_Q4 + i, 0);
-                    emit_mov_imm(&jit, ARM64_X4, 4080); // Expected value for equality
-                    // Compare and set result
-                    emit_u32(&jit, 0xeb04007f + (i << 5)); // CMP X(3+i), X4
-                    emit_u32(&jit, 0x9a9f0063 + (i << 5)); // CSET X(3+i), EQ
-                    
-                    // Push result to stack
-                    emit_mov_imm(&jit, ARM64_X4, 1);
-                    emit_add_reg(&jit, ARM64_X19, ARM64_X19, ARM64_X4); // sp++
-                    emit_str_imm(&jit, ARM64_X3 + i, ARM64_X21, i * 8); // stack[sp+i] = result
-                }
-                break;
-            }
-            
-            case VFM_STACK_PREFETCH: {
-                // Prefetch upcoming stack region to optimize cache performance
-                uint8_t depth = program[pc++];  // How many cache lines to prefetch
-                
-                // Prefetch both 64-bit and 128-bit stacks
-                for (int i = 0; i < depth && i < 8; i++) {
-                    // Prefetch 64-bit stack
-                    emit_prfm(&jit, 0, ARM64_X21, i * 64); // PLDL1KEEP
-                    // Prefetch 128-bit stack
-                    emit_prfm(&jit, 0, ARM64_X23, i * 64); // PLDL1KEEP
-                }
-                break;
-            }
-            
+
             case VFM_RET: {
-                // Return top of stack
-                emit_ldr_imm(&jit, ARM64_X0, ARM64_X21, 0);  // Load return value
-                
-                // Flush any remaining scheduled instructions before epilogue
+                emit_op_ret(&jit);
                 flush_scheduler(&scheduler, &jit);
-                
-                emit_epilogue(&jit);
-                
-                // Cleanup scheduler resources
                 free_scheduler(&scheduler);
-                
                 if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
-                    return NULL;
+                    return NULL;  // flush_and_protect_memory re-enables W^X + munmaps on failure
                 }
-                
                 return jit.code;
             }
-            
+
+            // Every other opcode -- including LD8/LD16/LD32, the comparisons,
+            // and the 128-bit NEON ops (LD128/EQ128/BULK_LOAD128/
+            // PARALLEL_EQ128) that previously emitted wrong or unvalidated
+            // code -- is DECLINED. We never emit a nop or a fabricated result.
+            // The caller leaves jit_code NULL and runs the bounds-checked
+            // interpreter, which implements every opcode correctly.
             default:
-                // Unsupported instruction - this opcode cannot be correctly
-                // compiled by the ARM64 JIT. Rather than emit a stub that
-                // fabricates a result (the old code emitted a truncated
-                // MOVZ of -1 that returned garbage, silently dropping or
-                // mis-matching packets), clean up all partially allocated
-                // JIT state and return NULL. vfm_load_program leaves
-                // vm->cold.jit_code == NULL on a NULL compile, so execution
-                // transparently falls back to the bounds-checked interpreter,
-                // which handles every opcode correctly. This mirrors the
-                // x86-64 stack-overflow bail precedent (PR #9).
-                //
-                // Use free_scheduler (NOT flush_scheduler): the buffered
-                // instructions must be discarded with the page, not emitted
-                // into it. init_scheduler malloc'd both sched->instructions
-                // and sched->dependency_map; free_scheduler frees both.
-                free_scheduler(&scheduler);
-#ifdef __APPLE__
-                // Re-enable W^X write protection that the compile entry
-                // disabled via pthread_jit_write_protect_np(0). The bail
-                // skips flush_and_protect_memory (the only other re-enabler),
-                // so without this the MAP_JIT pages are left writable (not
-                // executable) for this thread -- the toggle is thread-global
-                // and a later JIT execute/compile on the same thread could
-                // fault. Must stay inside __APPLE__: the non-Apple ARM64 path
-                // maps RWX and never calls this intrinsic.
-                pthread_jit_write_protect_np(1);
-#endif
-                munmap(code, code_size);
-                return NULL;
+                goto decline;
         }
     }
-    
-    // Default return
-    emit_mov_imm(&jit, ARM64_X0, 0);
-    
-    // Flush any remaining scheduled instructions before epilogue
-    flush_scheduler(&scheduler, &jit);
+
+    // Program ran off the end without a RET. Treat as uncompilable rather than
+    // fabricate a return value; the interpreter/verifier handle this case.
+decline:
     free_scheduler(&scheduler);
-    
-    emit_epilogue(&jit);
-    
-    if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
-        return NULL;
-    }
-    
-    return jit.code;
+#ifdef __APPLE__
+    pthread_jit_write_protect_np(1);
+#endif
+    munmap(code, code_size);
+    return NULL;
+}
+
+// JIT compile for ARM64 (single-core entry point)
+void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {
+    return vfm_jit_compile_arm64_impl(program, len, NULL);
 }
 
 // Check if JIT is available
@@ -769,138 +661,21 @@ bool vfm_jit_available_arm64(void) {
 #endif
 }
 
-// Phase 3.2.3: Adaptive ARM64 JIT compilation with packet pattern optimization
-void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len, 
+// Phase 3.2.3: Adaptive ARM64 JIT compilation with packet pattern optimization.
+//
+// The previous adaptive compiler was a separate, broken code generator (wrong
+// ABI, raw x0/x1 operands, missing W^X toggle, a `nop` default that silently
+// mis-filtered). It is discarded. Adaptive compilation now REUSES the exact
+// single-core compile core, prologue, ABI and decline path. The profile is
+// passed through for future prefetch/scheduling hints but may never alter
+// instruction semantics, so adaptive output is currently byte-for-byte the
+// same correct code as the single-core path. Any opcode outside the trusted
+// set declines (returns NULL) -> the caller keeps/falls back to the previous
+// valid page or the interpreter. This is the honest "decline, never nop"
+// contract until profile-guided emitters are individually oracle-validated.
+void* vfm_jit_compile_arm64_adaptive(const uint8_t *program, uint32_t len,
                                      vfm_execution_profile_t *profile) {
-    if (!profile) {
-        // Fall back to regular compilation if no profile available
-        return vfm_jit_compile_arm64(program, len);
-    }
-    
-    vfm_jit_arm64_t jit = {0};
-    jit.code_size = 4096;
-    
-    // Allocate JIT memory
-    jit.code = mmap(NULL, jit.code_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-    if (jit.code == MAP_FAILED) {
-        return NULL;
-    }
-    
-    // Emit function prologue
-    emit_u32(&jit, 0xa9bf7bfd);  // stp x29, x30, [sp, #-16]!
-    emit_u32(&jit, 0x910003fd);  // mov x29, sp
-    
-    // Phase 3.2.3: Adaptive instruction selection based on packet patterns
-    bool use_optimized_ipv4 = false;
-    bool use_optimized_ipv6 = false;
-    bool use_burst_optimizations = false;
-    
-    // Analyze packet patterns to select optimal instruction sequences
-    if (profile->packet_patterns.total_packets > 1000) {
-        uint64_t total = profile->packet_patterns.total_packets;
-        
-        // IPv4 optimization: Use specialized 32-bit operations for IPv4 addresses
-        if ((profile->packet_patterns.ipv4_packets * 100 / total) > 80) {
-            use_optimized_ipv4 = true;
-        }
-        
-        // IPv6 optimization: Use 128-bit NEON operations for IPv6 addresses
-        if ((profile->packet_patterns.ipv6_packets * 100 / total) > 80) {
-            use_optimized_ipv6 = true;
-        }
-        
-        // Burst optimization: Use prefetch and aggressive loop unrolling
-        if ((profile->packet_patterns.burst_packets * 100 / total) > 40) {
-            use_burst_optimizations = true;
-        }
-    }
-    
-    // Emit specialized instruction sequences based on patterns
-    uint32_t pc = 0;
-    while (pc < len) {
-        uint8_t opcode = program[pc];
-        
-        switch (opcode) {
-            case VFM_EQ32:
-                if (use_optimized_ipv4) {
-                    // Optimized IPv4 address comparison using 32-bit operations
-                    emit_u32(&jit, 0xb9400001); // ldr w1, [x0]  - load 32-bit value
-                    emit_u32(&jit, 0x6b01001f); // cmp w0, w1    - compare 32-bit
-                    emit_u32(&jit, 0x1a9f17e0); // cset x0, eq   - set result
-                } else {
-                    // Standard 32-bit comparison
-                    emit_u32(&jit, 0xf9400001); // ldr x1, [x0]
-                    emit_u32(&jit, 0xeb01001f); // cmp x0, x1
-                    emit_u32(&jit, 0x1a9f17e0); // cset x0, eq
-                }
-                break;
-                
-            case VFM_EQ128:
-                if (use_optimized_ipv6) {
-                    // Optimized IPv6 address comparison using NEON 128-bit operations
-                    emit_u32(&jit, 0x4c407800); // ld1 {v0.4s}, [x0]      - load 128-bit
-                    emit_u32(&jit, 0x4c407821); // ld1 {v1.4s}, [x1]      - load 128-bit
-                    emit_u32(&jit, 0x6e208c00); // cmeq v0.4s, v0.4s, v1.4s - compare
-                    emit_u32(&jit, 0x4e71b800); // addv s0, v0.4s          - reduce
-                    emit_u32(&jit, 0x1e260000); // fmov w0, s0             - extract result
-                } else {
-                    // Standard 128-bit comparison (fallback to 64-bit loads)
-                    emit_u32(&jit, 0xf9400001); // ldr x1, [x0]
-                    emit_u32(&jit, 0xf9400422); // ldr x2, [x1, #8]
-                    emit_u32(&jit, 0xeb02001f); // cmp x0, x2
-                    emit_u32(&jit, 0x1a9f17e0); // cset x0, eq
-                }
-                break;
-                
-            case VFM_PUSH32:
-                if (use_burst_optimizations) {
-                    // Burst-optimized push with prefetching
-                    emit_u32(&jit, 0xf8820020); // prfm pldl1strm, [x1, #32] - prefetch
-                    emit_u32(&jit, 0xb9400021); // ldr w1, [x1]              - load
-                    emit_u32(&jit, 0xb8204c21); // str w1, [x1], #4          - store and increment
-                } else {
-                    // Standard push
-                    emit_u32(&jit, 0xb9400021); // ldr w1, [x1]
-                    emit_u32(&jit, 0xb9000021); // str w1, [x1]
-                }
-                break;
-                
-            default: {
-                // Use hot path optimization for frequently executed instructions
-                bool is_hot_path = false;
-                for (uint32_t i = 0; i < profile->hot_path_count; i++) {
-                    if (profile->hot_paths[i] == pc) {
-                        is_hot_path = true;
-                        break;
-                    }
-                }
-                
-                if (is_hot_path && use_burst_optimizations) {
-                    // Add branch prediction hints for hot paths
-                    emit_u32(&jit, 0x14000001); // b +4 (hint: likely taken)
-                }
-                
-                // Standard opcode handling (simplified)
-                emit_u32(&jit, 0xd503201f); // nop (placeholder)
-                break;
-            }
-        }
-        
-        pc += vfm_instruction_size(opcode);
-        if (pc >= len) break;
-    }
-    
-    // Emit function epilogue
-    emit_u32(&jit, 0xa8c17bfd);  // ldp x29, x30, [sp], #16
-    emit_u32(&jit, 0xd65f03c0);  // ret
-    
-    // Flush and protect memory
-    if (!flush_and_protect_memory(jit.code, jit.code_pos, jit.code_size)) {
-        return NULL;
-    }
-    
-    return jit.code;
+    return vfm_jit_compile_arm64_impl(program, len, profile);
 }
 
 #else
