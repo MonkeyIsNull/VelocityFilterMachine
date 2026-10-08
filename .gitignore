@@ -80,6 +80,10 @@ tools/vfm-test
 # Test harness binaries (build outputs)
 test/test_vfm
 test/jit_test
+test/jit_test_asan
+test/test_multicore
+test/test_multicore_asan
+test/test_multicore_tsan
 
 # Benchmark binary
 bench/bench

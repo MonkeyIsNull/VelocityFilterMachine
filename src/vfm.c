@@ -22,11 +22,12 @@
 // Forward declarations for static functions
 static uint64_t get_timestamp_ns(void);
 static void* worker_thread(void *arg);
-static void* worker_thread_with_affinity(void *arg);
+static int set_thread_affinity(pthread_t thread, uint32_t core_id);
 static vfm_execution_profile_t* create_execution_profile(uint32_t instruction_count);
+static void free_execution_profile(vfm_execution_profile_t *profile);
 static void update_execution_profile(vfm_execution_profile_t *profile, uint32_t pc, bool branch_taken, uint64_t cycles);
 static void analyze_packet_pattern(vfm_execution_profile_t *profile, const uint8_t *packet, uint16_t len);
-static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program, uint32_t len);
+static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program, uint32_t len, size_t *out_size);
 static bool should_recompile(vfm_shared_context_t *shared);
 static void update_adaptive_thresholds(vfm_shared_context_t *shared);
 
@@ -387,13 +388,18 @@ int vfm_execute(vfm_state_t *vm, const uint8_t *packet, uint16_t packet_len) {
     vm->hot.insn_count = 0;
     vm->hot.error = VFM_SUCCESS;
     
-    // Try JIT execution first if available
+    // Try JIT execution first if available.
     if (vm->cold.jit_code) {
-        uint64_t result = vfm_jit_execute(vm->cold.jit_code, packet, packet_len);
-        if (result != (uint64_t)-1) {  // -1 indicates JIT failure, fall back to interpreter
-            return (result != 0) ? VFM_SUCCESS : VFM_ERROR_VERIFICATION_FAILED;
-        }
-        // JIT failed, fall back to interpreter
+        // The compiled RET returns top-of-stack via the canonical ABI -- the
+        // SAME value the interpreter's op_ret returns -- so we return it raw as
+        // an int and the JIT and interpreter paths agree in sign and sense
+        // (callers such as vfm_execute_batch map both with (result > 0) ? 1 : 0).
+        // No emitter ever produces a -1 "JIT failed" sentinel: a program the
+        // JIT cannot compile already left cold.jit_code == NULL at load time, so
+        // there is no runtime fallback branch to take here.
+        uint64_t result = vfm_jit_execute(vm->cold.jit_code, packet, packet_len,
+                                          vm->hot.stack, vm->hot.stack128);
+        return (int)result;
     }
     
     // Computed goto dispatch table for maximum performance
@@ -1197,14 +1203,24 @@ void vfm_destroy(vfm_state_t *vm) {
         free(vm->hot.stack128);
     }
     
-    // Clean up JIT code and cache reference
-    if (vm->cold.jit_cache_entry) {
-        vfm_jit_cache_release(vm->cold.jit_cache_entry);
-        vm->cold.jit_cache_entry = NULL;
-    }
-    if (vm->cold.jit_code && !vm->cold.jit_cache_entry) {
-        // Only free if not from cache (cache manages its own memory)
-        vfm_jit_free(vm->cold.jit_code, vm->cold.jit_code_size);
+    // Clean up JIT code and cache reference. If the page is BORROWED (a per-core
+    // VM pointing at the multicore shared page), this VM owns neither a cache
+    // entry nor the page: skip both the release and the free so the shared page
+    // is freed exactly once, by the multicore layer.
+    if (!vm->cold.jit_borrowed) {
+        // Decide whether this page is cache-owned BEFORE nulling the entry.
+        // vfm_jit_cache_release() only drops our ref_count; the cache still owns
+        // (and will munmap) the page. Freeing a cache-owned page here would leave
+        // the cache bucket holding a dangling pointer -> UAF on the next lookup.
+        bool from_cache = (vm->cold.jit_cache_entry != NULL);
+        if (vm->cold.jit_cache_entry) {
+            vfm_jit_cache_release(vm->cold.jit_cache_entry);
+            vm->cold.jit_cache_entry = NULL;
+        }
+        if (vm->cold.jit_code && !from_cache) {
+            // Only free if not from cache (cache manages its own memory)
+            vfm_jit_free(vm->cold.jit_code, vm->cold.jit_code_size);
+        }
     }
     vm->cold.jit_code = NULL;
     vm->cold.jit_code_size = 0;
@@ -1227,14 +1243,17 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
         return result;
     }
     
-    // Clean up any existing JIT code and cache reference
+    // Clean up any existing JIT code and cache reference. Decide whether the page
+    // is cache-owned BEFORE nulling the entry (see vfm_destroy): releasing only
+    // drops our ref_count, so freeing a cache-owned page would dangle the bucket.
+    bool had_cache_entry = (vm->cold.jit_cache_entry != NULL);
     if (vm->cold.jit_cache_entry) {
         vfm_jit_cache_release(vm->cold.jit_cache_entry);
         vm->cold.jit_cache_entry = NULL;
     }
     if (vm->cold.jit_code) {
         // Only free if not from cache (cache manages its own memory)
-        if (!vm->cold.jit_cache_entry) {
+        if (!had_cache_entry) {
             vfm_jit_free(vm->cold.jit_code, vm->cold.jit_code_size);
         }
         vm->cold.jit_code = NULL;
@@ -1298,6 +1317,11 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
                         vm->cold.jit_cache_entry->compile_time_ns = compile_time;
                         vm->cold.jit_code = jit_code;
                         vm->cold.jit_code_size = code_size;
+                    } else {
+                        // Cache store failed (full / alloc failure): release the
+                        // freshly compiled page so it does not leak. The VM falls
+                        // back to the interpreter (jit_code stays NULL).
+                        vfm_jit_free(jit_code, code_size);
                     }
                 }
             }
@@ -1314,6 +1338,11 @@ int vfm_load_program(vfm_state_t *vm, const uint8_t *program, uint32_t len) {
                     vm->cold.jit_cache_entry->compile_time_ns = compile_time;
                     vm->cold.jit_code = jit_code;
                     vm->cold.jit_code_size = code_size;
+                } else {
+                    // Cache store failed (full / alloc failure): release the
+                    // freshly compiled page so it does not leak. The VM falls
+                    // back to the interpreter (jit_code stays NULL).
+                    vfm_jit_free(jit_code, code_size);
                 }
             }
             #endif
@@ -1477,17 +1506,22 @@ void vfm_jit_free(void *code, size_t size) {
     }
 }
 
-// JIT function signature
-typedef uint64_t (*vfm_jit_func_t)(const uint8_t *packet, uint16_t packet_len);
+// JIT function signature (canonical 4-argument convention; see vfm.h).
+// X0/RDI = packet, X1/RSI = len, X2/RDX = stack64 base, X3/RCX = stack128 base.
+typedef uint64_t (*vfm_jit_func_t)(const uint8_t *packet, uint16_t packet_len,
+                                   uint64_t *stack64, vfm_u128_t *stack128);
 
-// Execute JIT compiled code
-uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len) {
+// Execute JIT compiled code. The caller supplies the operand stacks, so the
+// compiled page carries no dependence on any VM struct layout and is safe to
+// run concurrently from many threads (each passing its own stacks).
+uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len,
+                         uint64_t *stack64, vfm_u128_t *stack128) {
     if (!jit_code || !packet) {
         return 0;
     }
-    
+
     vfm_jit_func_t func = (vfm_jit_func_t)jit_code;
-    return func(packet, packet_len);
+    return func(packet, packet_len, stack64, stack128);
 }
 
 // Platform-specific timestamp function for JIT cache
@@ -1506,7 +1540,7 @@ static uint64_t get_timestamp_ns(void) {
 // ============================================================================
 
 // Atomic flow table lookup with lock-free access
-static VFM_ALWAYS_INLINE uint64_t flow_table_get_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key) {
+static VFM_ALWAYS_INLINE __attribute__((unused)) uint64_t flow_table_get_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key) {
     if (VFM_UNLIKELY(!flow_table)) return 0;
     
     uint32_t index = key & flow_table_mask;
@@ -1537,7 +1571,7 @@ static VFM_ALWAYS_INLINE uint64_t flow_table_get_lockfree(vfm_flow_entry_t *flow
 }
 
 // Atomic flow table insertion with lock-free access using compare-and-swap
-static VFM_ALWAYS_INLINE bool flow_table_set_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key, uint64_t value) {
+static VFM_ALWAYS_INLINE __attribute__((unused)) bool flow_table_set_lockfree(vfm_flow_entry_t *flow_table, uint32_t flow_table_mask, uint64_t key, uint64_t value) {
     if (VFM_UNLIKELY(!flow_table)) return false;
     
     uint32_t index = key & flow_table_mask;
@@ -1599,111 +1633,81 @@ static uint32_t get_cpu_count(void) {
 }
 
 // Worker thread function for multi-core execution
+// Persistent per-worker argument. The worker's packet range and the batch
+// pointer live on mc_vm (written by the owner under pool_mutex), not here, so
+// this struct is stable for the whole lifetime of the pool.
 typedef struct worker_context {
     vfm_multicore_state_t *mc_vm;
-    vfm_core_context_t *core_ctx;
-    uint32_t thread_id;
-    volatile bool *shutdown;
-    
-    // Work queue for this thread
-    const uint8_t **packets;
-    uint16_t *packet_lengths;
-    uint8_t *results;
-    uint32_t start_idx;
-    uint32_t end_idx;
-    
-    // Synchronization
-    pthread_mutex_t *work_mutex;
-    pthread_cond_t *work_cond;
-    volatile bool work_ready;
-    
+    uint32_t index;
 } worker_context_t;
 
+// Worker thread body: a persistent loop driven by a generation/completed-count
+// barrier. Each worker owns a full interpreter-backed vfm_state_t (core->vm)
+// with its own operand stacks, so there is no shared mutable VM state; the only
+// object executed concurrently is the read-execute JIT page (core->vm->cold.
+// jit_code), which is safe to run from many threads. Results are produced by
+// vfm_execute, which matches the single-core interpreter oracle by construction
+// (it IS the single-core engine) and transparently uses the JIT when a page is
+// installed, with automatic per-core interpreter fallback.
 static void* worker_thread(void *arg) {
     worker_context_t *ctx = (worker_context_t*)arg;
-    vfm_core_context_t *core = ctx->core_ctx;
-    vfm_shared_context_t *shared = ctx->mc_vm->shared;
-    
-    while (!*ctx->shutdown) {
-        // Wait for work
-        pthread_mutex_lock(ctx->work_mutex);
-        while (!ctx->work_ready && !*ctx->shutdown) {
-            pthread_cond_wait(ctx->work_cond, ctx->work_mutex);
-        }
-        pthread_mutex_unlock(ctx->work_mutex);
-        
-        if (*ctx->shutdown) break;
-        
-        // Process assigned packet range
-        for (uint32_t i = ctx->start_idx; i < ctx->end_idx; i++) {
-            core->packet = ctx->packets[i];
-            core->hot.packet_len = ctx->packet_lengths[i];
-            
-            // Reset execution state for each packet
-            core->hot.pc = 0;
-            core->hot.sp = 0;
-            core->hot.insn_count = 0;
-            core->hot.error = VFM_SUCCESS;
-            
-            // Example of lock-free flow table access during execution
-            // In real implementation, this would be integrated into VFM opcodes
-            if (ctx->mc_vm->flow_table) {
-                // Create a simple flow key from packet data (simplified)
-                uint64_t flow_key = 0;
-                if (core->hot.packet_len >= 20) {
-                    // Use first 8 bytes of packet as flow key (simplified)
-                    flow_key = *(uint64_t*)core->packet;
-                }
-                
-                // Lock-free flow table lookup
-                uint64_t flow_value = flow_table_get_lockfree(ctx->mc_vm->flow_table, 
-                                                            ctx->mc_vm->flow_table_mask, 
-                                                            flow_key);
-                
-                // Update flow statistics (per-core, no locks needed)
-                core->flow_stats.lookups++;
-                if (flow_value != 0) {
-                    core->flow_stats.hits++;
-                } else {
-                    core->flow_stats.misses++;
-                    
-                    // Try to insert new flow entry (lock-free)
-                    uint64_t new_value = i + 1; // Simplified value
-                    if (flow_table_set_lockfree(ctx->mc_vm->flow_table, 
-                                               ctx->mc_vm->flow_table_mask, 
-                                               flow_key, new_value)) {
-                        // Successfully inserted
-                    }
-                }
-            }
-            
-            // Phase 3.2.1: Profile-guided execution with runtime data collection
-            uint64_t execution_start = get_timestamp_ns();
-            
-            // Execute filter (using existing vfm_execute logic)
-            // For now, simplified execution - would use actual VFM interpreter
-            int result = 1; // Placeholder: would call actual VFM execution
-            
-            uint64_t execution_cycles = get_timestamp_ns() - execution_start;
-            
-            // Update execution profile if available
-            if (shared->execution_profile) {
-                // Update profile for current instruction (simplified - using pc=0)
-                update_execution_profile(shared->execution_profile, core->hot.pc, 
-                                       result == 1, execution_cycles);
-                
-                // Analyze packet pattern for adaptive optimization
-                analyze_packet_pattern(shared->execution_profile, core->packet, core->hot.packet_len);
-            }
-            
-            ctx->results[i] = (uint8_t)result;
-            core->hot.insn_count++;
-        }
-        
-        // Mark work as completed
-        ctx->work_ready = false;
+    vfm_multicore_state_t *mc_vm = ctx->mc_vm;
+    uint32_t idx = ctx->index;
+    vfm_core_context_t *core = mc_vm->cores[idx];
+    uint64_t seen_generation = 0;
+
+    // Best-effort core pinning (advisory on macOS); harmless if it fails.
+    if (mc_vm->shared->hints.use_prefetch) {
+        set_thread_affinity(pthread_self(), idx);
     }
-    
+
+    for (;;) {
+        // Wait for the next generation, or shutdown. `generation` is
+        // level-triggered state, so a spurious wakeup or a broadcast that
+        // arrives before we wait cannot wedge the worker.
+        pthread_mutex_lock(&mc_vm->pool_mutex);
+        while (mc_vm->generation == seen_generation && !mc_vm->shutdown) {
+            pthread_cond_wait(&mc_vm->work_cond, &mc_vm->pool_mutex);
+        }
+        if (mc_vm->shutdown) {
+            pthread_mutex_unlock(&mc_vm->pool_mutex);
+            break;
+        }
+        // Snapshot this generation's assignment under the lock. Acquiring the
+        // lock here synchronizes-with the owner's prior unlock, so the batch
+        // pointers and any freshly published core->vm->cold.jit_code are
+        // visible with correct happens-before ordering.
+        uint64_t gen = mc_vm->generation;
+        vfm_batch_t *batch = mc_vm->cur_batch;
+        uint32_t start = mc_vm->worker_start[idx];
+        uint32_t end   = mc_vm->worker_end[idx];
+        pthread_mutex_unlock(&mc_vm->pool_mutex);
+
+        // Process the assigned range on this core's own VM. The range may be
+        // empty (fewer packets than cores): we still fall through to the
+        // completion step and increment exactly once, or the barrier below
+        // could never reach num_cores.
+        uint64_t insns = 0;
+        if (batch) {
+            vfm_state_t *vm = core->vm;
+            for (uint32_t i = start; i < end; i++) {
+                int rc = vfm_execute(vm, batch->packets[i], batch->lengths[i]);
+                batch->results[i] = (rc > 0) ? 1 : 0;
+                insns += vm->hot.insn_count;
+            }
+        }
+        core->hot.insn_count = (uint32_t)insns;  // for stats aggregation only
+
+        // Completion barrier: increment the shared counter under the lock and,
+        // when we are the last worker of this generation, wake the owner.
+        pthread_mutex_lock(&mc_vm->pool_mutex);
+        seen_generation = gen;
+        if (++mc_vm->completed_count == mc_vm->num_cores) {
+            pthread_cond_signal(&mc_vm->done_cond);
+        }
+        pthread_mutex_unlock(&mc_vm->pool_mutex);
+    }
+
     return NULL;
 }
 
@@ -1834,29 +1838,103 @@ vfm_multicore_state_t* vfm_multicore_create(uint32_t num_cores) {
         memset(mc_vm->flow_table, 0, table_size);
         mc_vm->flow_table_mask = flow_table_size - 1;
     }
-    
+
+    // Phase 3.1 (fixed): bring up the persistent worker pool ONCE, here, rather
+    // than creating and joining threads every batch (the old create-then-join
+    // deadlock). Threads park on work_cond until the first generation is
+    // published by execute_batch; core->vm is still NULL at this point, but a
+    // worker only dereferences it when cur_batch != NULL, which cannot happen
+    // before load_program + execute_batch.
+    mc_vm->generation = 0;
+    mc_vm->completed_count = 0;
+    mc_vm->shutdown = false;
+    mc_vm->cur_batch = NULL;
+    mc_vm->threshold_update_counter = 0;
+    mc_vm->active_cores = 0;
+
+    mc_vm->worker_ctx   = calloc(num_cores, sizeof(worker_context_t));
+    mc_vm->worker_start = calloc(num_cores, sizeof(uint32_t));
+    mc_vm->worker_end   = calloc(num_cores, sizeof(uint32_t));
+    if (!mc_vm->worker_ctx || !mc_vm->worker_start || !mc_vm->worker_end) {
+        vfm_multicore_destroy(mc_vm);
+        return NULL;
+    }
+
+    if (pthread_mutex_init(&mc_vm->pool_mutex, NULL) != 0 ||
+        pthread_cond_init(&mc_vm->work_cond, NULL) != 0 ||
+        pthread_cond_init(&mc_vm->done_cond, NULL) != 0) {
+        vfm_multicore_destroy(mc_vm);
+        return NULL;
+    }
+    // From here on the sync primitives are live; mark the pool started so the
+    // single teardown path in vfm_multicore_destroy destroys them exactly once
+    // (and joins however many workers actually came up, tracked by active_cores).
+    mc_vm->pool_started = true;
+
+    for (uint32_t i = 0; i < num_cores; i++) {
+        mc_vm->worker_ctx[i].mc_vm = mc_vm;
+        mc_vm->worker_ctx[i].index = i;
+        if (pthread_create(&mc_vm->threads[i], NULL, worker_thread,
+                           &mc_vm->worker_ctx[i]) != 0) {
+            // active_cores already counts the workers that came up; destroy
+            // signals shutdown, joins exactly those, and destroys the
+            // primitives. The not-yet-started workers never block the barrier
+            // because execute_batch waits on completed_count == num_cores and
+            // will not be reached (create fails).
+            vfm_multicore_destroy(mc_vm);
+            return NULL;
+        }
+        mc_vm->active_cores++;
+    }
+
     return mc_vm;
 }
 
 // Destroy multi-core VFM state
 void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm) {
     if (!mc_vm) return;
-    
-    // Signal shutdown to all threads
-    mc_vm->shutdown = true;
-    
-    // Wait for all threads to complete
-    if (mc_vm->threads) {
-        for (uint32_t i = 0; i < mc_vm->active_cores; i++) {
-            pthread_join(mc_vm->threads[i], NULL);
+
+    // Shut down the persistent worker pool. Must set shutdown AND broadcast
+    // UNDER pool_mutex: a worker sitting between its predicate check and
+    // pthread_cond_wait would otherwise miss the broadcast and never exit.
+    // Then join exactly the workers that came up (active_cores) and destroy the
+    // primitives AFTER the joins so no waiter touches a destroyed cond.
+    if (mc_vm->pool_started) {
+        pthread_mutex_lock(&mc_vm->pool_mutex);
+        mc_vm->shutdown = true;
+        pthread_cond_broadcast(&mc_vm->work_cond);
+        pthread_mutex_unlock(&mc_vm->pool_mutex);
+
+        if (mc_vm->threads) {
+            for (uint32_t i = 0; i < mc_vm->active_cores; i++) {
+                pthread_join(mc_vm->threads[i], NULL);
+            }
         }
-        free(mc_vm->threads);
+
+        pthread_mutex_destroy(&mc_vm->pool_mutex);
+        pthread_cond_destroy(&mc_vm->work_cond);
+        pthread_cond_destroy(&mc_vm->done_cond);
+        mc_vm->pool_started = false;
     }
-    
-    // Cleanup per-core contexts
+
+    if (mc_vm->threads) {
+        free(mc_vm->threads);
+        mc_vm->threads = NULL;
+    }
+    free(mc_vm->worker_ctx);
+    free(mc_vm->worker_start);
+    free(mc_vm->worker_end);
+
+    // Cleanup per-core contexts. Each core's VM is interpreter-only and borrows
+    // the shared JIT page (cold.jit_borrowed == true), so vfm_destroy will NOT
+    // free that page here -- it is owned and freed exactly once by this
+    // function (the shared-context block below) or by a recompile swap.
     if (mc_vm->cores) {
         for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
             if (mc_vm->cores[i]) {
+                if (mc_vm->cores[i]->vm) {
+                    vfm_destroy(mc_vm->cores[i]->vm);
+                }
                 if (mc_vm->cores[i]->stack) {
                     free(mc_vm->cores[i]->stack);
                 }
@@ -1865,7 +1943,7 @@ void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm) {
         }
         free(mc_vm->cores);
     }
-    
+
     // Cleanup shared flow table
     if (mc_vm->flow_table) {
         size_t table_size __attribute__((unused)) = (mc_vm->flow_table_mask + 1) * sizeof(vfm_flow_entry_t);
@@ -1875,16 +1953,119 @@ void vfm_multicore_destroy(vfm_multicore_state_t *mc_vm) {
             free(mc_vm->flow_table);
         #endif
     }
-    
-    // Cleanup shared context
+
+    // Cleanup shared context: the shared JIT page is freed exactly once here,
+    // with its true recorded size; also free the owned program copy and profile.
     if (mc_vm->shared) {
         if (mc_vm->shared->jit_code) {
             vfm_jit_free(mc_vm->shared->jit_code, mc_vm->shared->jit_code_size);
+            mc_vm->shared->jit_code = NULL;
+        }
+        if (mc_vm->shared->program) {
+            // load_program copies the program into shared ownership.
+            free((void*)mc_vm->shared->program);
+            mc_vm->shared->program = NULL;
+        }
+        if (mc_vm->shared->execution_profile) {
+            free_execution_profile(mc_vm->shared->execution_profile);
+            mc_vm->shared->execution_profile = NULL;
         }
         free(mc_vm->shared);
     }
-    
+
     free(mc_vm);
+}
+
+// The multicore layer trusts the JIT only for opcodes whose emitters are
+// oracle-validated on EVERY supported architecture: PUSH, ADD and RET (the
+// ARM64 single-core trusted set). This is the "decline, never emit wrong code"
+// contract applied uniformly:
+//   - ARM64: the single-core compiler already compiles only PUSH/ADD/RET and
+//     declines the rest, so this gate is redundant but harmless there.
+//   - x86-64: the legacy single-core compiler accepts a far wider opcode range,
+//     but some of those emitters do NOT match the interpreter (e.g. LD8 emits
+//     `MOV r8,[mem]` without zero-extension, so a loaded byte carries garbage in
+//     bits 8-63 and a following compare diverges from the interpreter oracle).
+//     Trusting them in the multicore path would make worker results disagree
+//     with the single-core interpreter oracle.
+// Any program using an opcode outside this set declines (returns NULL) and every
+// core runs the bounds-checked interpreter, which implements all opcodes
+// correctly. This keeps the multicore contract identical and correct on both
+// architectures and matches the test corpus's expectation that only PUSH/ADD/RET
+// programs install a shared JIT page.
+static bool program_jit_trusted(const uint8_t *program, uint32_t len) {
+    for (uint32_t pc = 0; pc < len; ) {
+        uint8_t opcode = program[pc];
+        if (opcode != VFM_PUSH && opcode != VFM_ADD && opcode != VFM_RET) {
+            return false;
+        }
+        uint32_t sz = vfm_instruction_size(opcode);
+        if (sz == 0) return false;  // malformed; let the interpreter/verifier handle it
+        pc += sz;
+    }
+    return true;
+}
+
+// Compile for the current arch and report the TRUE allocated size of the
+// returned RX page. The ARM64 JIT always maps a fixed 4096-byte page; the
+// x86-64 JIT maps len*32. Recording the real size matters: munmap with a wrong
+// size (the old code stored len*32 even on ARM64) either leaves the page mapped
+// or unmaps adjacent live mappings. Returns NULL / *out_size 0 on decline.
+static void *jit_compile_sized(const uint8_t *program, uint32_t len, size_t *out_size) {
+    void *code = NULL;
+    size_t size = 0;
+    if (!program_jit_trusted(program, len)) {
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+#ifdef __aarch64__
+    code = vfm_jit_compile_arm64(program, len);
+    if (code) size = 4096;
+#elif defined(__x86_64__)
+    code = vfm_jit_compile_x86_64(program, len);
+    if (code) size = (size_t)len * 32;
+#else
+    (void)program; (void)len;
+#endif
+    if (out_size) *out_size = size;
+    return code;
+}
+
+// Adaptive variant used by recompilation; same true-size reporting and the same
+// trusted-opcode gate (profile-guided optimization may never widen the set of
+// opcodes we emit, only tune how the trusted ones are scheduled).
+static void *jit_compile_adaptive_sized(const uint8_t *program, uint32_t len,
+                                        vfm_execution_profile_t *profile, size_t *out_size) {
+    void *code = NULL;
+    size_t size = 0;
+    if (!program_jit_trusted(program, len)) {
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+#ifdef __aarch64__
+    code = vfm_jit_compile_arm64_adaptive(program, len, profile);
+    if (code) size = 4096;
+#elif defined(__x86_64__)
+    code = vfm_jit_compile_x86_64_adaptive(program, len, profile);
+    if (code) size = (size_t)len * 32;
+#else
+    (void)program; (void)len; (void)profile;
+#endif
+    if (out_size) *out_size = size;
+    return code;
+}
+
+// Publish a JIT page (or NULL) into every core's VM. Each core borrows the page
+// (jit_borrowed = true when non-NULL) so vfm_destroy never frees it per-core.
+static void publish_jit_to_cores(vfm_multicore_state_t *mc_vm, void *code, size_t size) {
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        vfm_state_t *cvm = mc_vm->cores[i]->vm;
+        if (!cvm) continue;
+        cvm->cold.jit_code = code;
+        cvm->cold.jit_code_size = size;
+        cvm->cold.jit_borrowed = (code != NULL);
+        mc_vm->cores[i]->jit_code = code;  // keep the vestigial field coherent
+    }
 }
 
 // Load program into multi-core VFM
@@ -1892,142 +2073,190 @@ int vfm_multicore_load_program(vfm_multicore_state_t *mc_vm, const uint8_t *prog
     if (!mc_vm || !program || len == 0) {
         return VFM_ERROR_INVALID_PROGRAM;
     }
-    
-    // Store program in shared context (read-only across all cores)
-    mc_vm->shared->program = program;
+
+    int vr = vfm_verify(program, len);
+    if (vr != VFM_SUCCESS) {
+        return vr;
+    }
+
+    // Release any state from a previous load (supports reload on one handle).
+    if (mc_vm->shared->jit_code) {
+        vfm_jit_free(mc_vm->shared->jit_code, mc_vm->shared->jit_code_size);
+        mc_vm->shared->jit_code = NULL;
+        mc_vm->shared->jit_code_size = 0;
+    }
+    if (mc_vm->shared->execution_profile) {
+        free_execution_profile(mc_vm->shared->execution_profile);
+        mc_vm->shared->execution_profile = NULL;
+    }
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        if (mc_vm->cores[i]->vm) {
+            vfm_destroy(mc_vm->cores[i]->vm);
+            mc_vm->cores[i]->vm = NULL;
+            mc_vm->cores[i]->jit_code = NULL;
+        }
+    }
+    if (mc_vm->shared->program) {
+        free((void*)mc_vm->shared->program);
+        mc_vm->shared->program = NULL;
+    }
+
+    // Own a private copy of the program: recompile (between batches) and the
+    // per-core VMs dereference it later, so it must not depend on the caller
+    // keeping its buffer alive.
+    uint8_t *prog_copy = malloc(len);
+    if (!prog_copy) {
+        return VFM_ERROR_NO_MEMORY;
+    }
+    memcpy(prog_copy, program, len);
+    mc_vm->shared->program = prog_copy;
     mc_vm->shared->program_len = len;
-    
-    // Phase 3.2: Initialize execution profile for adaptive optimization
-    uint32_t estimated_instruction_count = len; // Rough estimate
-    mc_vm->shared->execution_profile = create_execution_profile(estimated_instruction_count);
-    
-    // Compile JIT code once for all cores
+
+    mc_vm->shared->execution_profile = create_execution_profile(len);
+    mc_vm->shared->total_executions = 0;
+    mc_vm->shared->opt_level = VFM_JIT_OPT_NONE;
+
+    // Compile the shared JIT page once for all cores (true size recorded).
+    // NULL means the program declined -> every core runs the interpreter.
     if (mc_vm->shared->jit_enabled) {
-        #ifdef __aarch64__
-            mc_vm->shared->jit_code = vfm_jit_compile_arm64(program, len);
-        #elif defined(__x86_64__)
-            mc_vm->shared->jit_code = vfm_jit_compile_x86_64(program, len);
-        #endif
-        
-        if (mc_vm->shared->jit_code) {
-            mc_vm->shared->jit_code_size = len * 32; // Estimated size
+        size_t sz = 0;
+        void *code = jit_compile_sized(prog_copy, len, &sz);
+        if (code) {
+            mc_vm->shared->jit_code = code;
+            mc_vm->shared->jit_code_size = sz;
             mc_vm->shared->opt_level = VFM_JIT_OPT_BASIC;
         }
     }
-    
+
+    // Back each core with a full interpreter-only vfm_state_t. jit_enabled is
+    // cleared BEFORE vfm_load_program so the per-core VM never compiles or
+    // caches its own page -- the multicore layer is the sole publisher.
+    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
+        vfm_state_t *cvm = vfm_create();
+        if (!cvm) {
+            return VFM_ERROR_NO_MEMORY;
+        }
+        cvm->cold.jit_enabled = false;
+        int lr = vfm_load_program(cvm, prog_copy, len);
+        if (lr != VFM_SUCCESS) {
+            vfm_destroy(cvm);
+            return lr;
+        }
+        mc_vm->cores[i]->vm = cvm;
+    }
+
+    // Publish the shared page (borrowed) into every core.
+    publish_jit_to_cores(mc_vm, mc_vm->shared->jit_code, mc_vm->shared->jit_code_size);
+
     return VFM_SUCCESS;
 }
 
-// Execute batch of packets across multiple cores
+// Execute a batch of packets across the persistent worker pool.
+//
+// No per-batch thread creation or joining (the old create-then-join deadlock
+// is gone). The owner publishes one generation of work and waits on a
+// completed-count barrier; workers run their ranges and signal done. Taking
+// pool_mutex for the whole call also SERIALIZES two concurrent callers on one
+// mc_vm -- documented contract: concurrent batches on a single handle are
+// serialized, not interleaved (interleaving would shred the barrier and race
+// the jit_code swap).
 int vfm_multicore_execute_batch(vfm_multicore_state_t *mc_vm, vfm_batch_t *batch) {
     if (!mc_vm || !batch || batch->count == 0) {
         return VFM_ERROR_INVALID_PROGRAM;
     }
-    
+    if (!mc_vm->pool_started) {
+        return VFM_ERROR_INVALID_PROGRAM;  // no worker pool (create failed)
+    }
+
     uint32_t packets_per_core = batch->count / mc_vm->num_cores;
     uint32_t remaining_packets = batch->count % mc_vm->num_cores;
-    
-    // Allocate worker contexts
-    worker_context_t *workers = calloc(mc_vm->num_cores, sizeof(worker_context_t));
-    if (!workers) return VFM_ERROR_NO_MEMORY;
-    
-    pthread_mutex_t work_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t work_cond = PTHREAD_COND_INITIALIZER;
-    
-    // Distribute work across cores
+
+    pthread_mutex_lock(&mc_vm->pool_mutex);
+
+    // Assign each worker a contiguous packet range (remainder spread over the
+    // first `remaining_packets` cores). Ranges may be empty when there are
+    // fewer packets than cores; empty-range workers still complete the
+    // generation exactly once, so the barrier below can reach num_cores.
     uint32_t current_packet = 0;
     for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
-        workers[i].mc_vm = mc_vm;
-        workers[i].core_ctx = mc_vm->cores[i];
-        workers[i].thread_id = i;
-        workers[i].shutdown = &mc_vm->shutdown;
-        
-        workers[i].packets = batch->packets;
-        workers[i].packet_lengths = batch->lengths;
-        workers[i].results = batch->results;
-        workers[i].start_idx = current_packet;
-        
-        uint32_t packets_for_this_core = packets_per_core;
-        if (i < remaining_packets) packets_for_this_core++; // Distribute remainder
-        
-        workers[i].end_idx = current_packet + packets_for_this_core;
-        current_packet = workers[i].end_idx;
-        
-        workers[i].work_mutex = &work_mutex;
-        workers[i].work_cond = &work_cond;
-        workers[i].work_ready = true;
-        
-        // Create thread with affinity if enabled
-        void* (*thread_func)(void*) = mc_vm->shared->hints.use_prefetch ? 
-                                     worker_thread_with_affinity : worker_thread;
-        
-        if (pthread_create(&mc_vm->threads[i], NULL, thread_func, &workers[i]) != 0) {
-            // Cleanup on thread creation failure
-            for (uint32_t j = 0; j < i; j++) {
-                pthread_cancel(mc_vm->threads[j]);
-                pthread_join(mc_vm->threads[j], NULL);
-            }
-            free(workers);
-            return VFM_ERROR_NO_MEMORY;
-        }
+        uint32_t n = packets_per_core + (i < remaining_packets ? 1u : 0u);
+        mc_vm->worker_start[i] = current_packet;
+        mc_vm->worker_end[i]   = current_packet + n;
+        current_packet += n;
     }
-    
-    mc_vm->active_cores = mc_vm->num_cores;
-    
-    // Signal all threads to start work
-    pthread_mutex_lock(&work_mutex);
-    pthread_cond_broadcast(&work_cond);
-    pthread_mutex_unlock(&work_mutex);
-    
-    // Wait for all threads to complete
-    for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
-        pthread_join(mc_vm->threads[i], NULL);
+
+    // Publish the generation and wake the workers.
+    mc_vm->cur_batch = batch;
+    mc_vm->completed_count = 0;
+    mc_vm->generation++;
+    pthread_cond_broadcast(&mc_vm->work_cond);
+
+    // Barrier: wait until every worker has finished this generation.
+    while (mc_vm->completed_count < mc_vm->num_cores) {
+        pthread_cond_wait(&mc_vm->done_cond, &mc_vm->pool_mutex);
     }
-    
-    mc_vm->active_cores = 0;
-    
-    // Phase 3.2.1: Check for adaptive recompilation after batch execution
+
+    // The pool is now quiescent: every worker is parked waiting for the next
+    // generation. All profiling, the recompile decision, the jit_code swap and
+    // the free-of-old page happen HERE, still under pool_mutex, so they are
+    // sequenced-before the next generation++ that releases the next batch. No
+    // worker can be executing the old page at free time.
+    mc_vm->shared->total_executions += batch->count;
+
     if (mc_vm->shared->execution_profile) {
-        mc_vm->shared->total_executions += batch->count;
-        
-        // Phase 3.2.4: Update adaptive thresholds periodically
-        static uint64_t threshold_update_counter = 0;
-        threshold_update_counter += batch->count;
-        
-        // Update thresholds every 5000 executions
-        if (threshold_update_counter >= 5000) {
-            update_adaptive_thresholds(mc_vm->shared);
-            threshold_update_counter = 0;
+        vfm_execution_profile_t *prof = mc_vm->shared->execution_profile;
+
+        // Owner-side, single-threaded profile update (replaces the old racy
+        // per-worker writes to the shared profile). Sample a few packets for
+        // pattern hints used by the adaptive compiler.
+        uint32_t sample = batch->count < 8 ? batch->count : 8;
+        for (uint32_t i = 0; i < sample; i++) {
+            analyze_packet_pattern(prof, batch->packets[i], batch->lengths[i]);
         }
-        
-        // Check if we should trigger adaptive recompilation
-        if (should_recompile(mc_vm->shared)) {
-            // Trigger adaptive JIT recompilation with collected profile data
-            void *new_jit_code = adaptive_jit_recompile(mc_vm->shared, 
-                                                       mc_vm->shared->program, 
-                                                       mc_vm->shared->program_len);
-            if (new_jit_code) {
-                // Update all cores with new optimized JIT code
-                for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
-                    // Note: In production, this would need proper synchronization
-                    // and cleanup of old JIT code
-                    mc_vm->cores[i]->jit_code = new_jit_code;
+        update_execution_profile(prof, 0, true, 0);
+
+        mc_vm->threshold_update_counter += batch->count;
+        if (mc_vm->threshold_update_counter >= 5000) {
+            update_adaptive_thresholds(mc_vm->shared);
+            mc_vm->threshold_update_counter = 0;
+        }
+
+        if (mc_vm->shared->jit_enabled && should_recompile(mc_vm->shared)) {
+            // Compile-into-temp + swap-on-success. Capture the OLD page+size
+            // BEFORE overwriting; free it only AFTER the new page is published
+            // to every core, and with the OLD captured size.
+            void  *old_code = mc_vm->shared->jit_code;
+            size_t old_size = mc_vm->shared->jit_code_size;
+            size_t new_size = 0;
+            void  *new_code = adaptive_jit_recompile(mc_vm->shared,
+                                                     mc_vm->shared->program,
+                                                     mc_vm->shared->program_len,
+                                                     &new_size);
+            if (new_code) {
+                mc_vm->shared->jit_code = new_code;
+                mc_vm->shared->jit_code_size = new_size;
+                mc_vm->shared->opt_level = VFM_JIT_OPT_ADAPTIVE;
+                publish_jit_to_cores(mc_vm, new_code, new_size);
+                if (old_code) {
+                    vfm_jit_free(old_code, old_size);
                 }
-                
-                // Reset execution count for next optimization cycle
-                mc_vm->shared->total_executions = 0;
             }
+            // On DECLINE (new_code == NULL): shared->jit_code and every core
+            // keep pointing at the previous valid page. We never free or NULL
+            // the live page on a failed recompile -- this is the UAF fix.
+            mc_vm->shared->total_executions = 0;
         }
     }
-    
-    // Update global statistics
+
+    // Aggregate stats while workers are parked (no concurrent writers).
     mc_vm->global_stats.total_packets += batch->count;
     for (uint32_t i = 0; i < mc_vm->num_cores; i++) {
         mc_vm->global_stats.total_instructions += mc_vm->cores[i]->hot.insn_count;
         mc_vm->global_stats.core_utilization[i]++;
     }
-    
-    free(workers);
+
+    mc_vm->cur_batch = NULL;
+    pthread_mutex_unlock(&mc_vm->pool_mutex);
     return VFM_SUCCESS;
 }
 
@@ -2083,20 +2312,9 @@ static int set_thread_affinity(pthread_t thread, uint32_t core_id) {
 #endif
 }
 
-
-// Enhanced worker thread function with affinity
-static void* worker_thread_with_affinity(void *arg) {
-    worker_context_t *ctx = (worker_context_t*)arg;
-    vfm_core_context_t *core __attribute__((unused)) = ctx->core_ctx;
-    
-    // Set thread affinity to specific core
-    if (set_thread_affinity(pthread_self(), ctx->thread_id) == 0) {
-        // Successfully set affinity
-    }
-    
-    // Call the regular worker thread implementation
-    return worker_thread(arg);
-}
+// (worker_thread_with_affinity was removed: the persistent pool sets affinity
+// once at worker startup inside worker_thread, so a per-batch wrapper is no
+// longer needed.)
 
 // Configure thread affinity for multi-core VFM
 int vfm_multicore_set_thread_affinity(vfm_multicore_state_t *mc_vm, bool enable) {
@@ -2170,6 +2388,18 @@ static vfm_execution_profile_t* create_execution_profile(uint32_t instruction_co
     profile->branch_hints.likely_not_taken = calloc(profile->branch_hints.hint_count, sizeof(uint32_t));
     
     return profile;
+}
+
+// Free an execution profile and all of its sub-allocations. (The previous code
+// created profiles in load_program but never freed them -- a leak on destroy
+// and on reload.)
+static void free_execution_profile(vfm_execution_profile_t *profile) {
+    if (!profile) return;
+    free(profile->instruction_profiles);
+    free(profile->hot_paths);
+    free(profile->branch_hints.likely_taken);
+    free(profile->branch_hints.likely_not_taken);
+    free(profile);
 }
 
 
@@ -2336,12 +2566,23 @@ static void generate_branch_hints(vfm_execution_profile_t *profile) {
     }
 }
 
-// Phase 3.2.2: Adaptive JIT recompilation with packet pattern optimization
-static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program, uint32_t len) {
+// Phase 3.2.2: Adaptive JIT recompilation with packet pattern optimization.
+//
+// COMPILE-INTO-TEMP ONLY. This function must NOT touch shared->jit_code or the
+// per-core pages: it computes profile-guided hints and returns a FRESH compiled
+// page (and its true size via *out_size), or NULL if the program declined. The
+// caller (vfm_multicore_execute_batch, holding pool_mutex with the pool
+// quiescent) performs the swap-on-success and frees the old page afterward. The
+// previous version freed+nulled shared->jit_code at the top before recompiling,
+// so a declined recompile left every core pointing at a freed page -- a
+// use-after-free. Leaving the live page untouched here is the fix.
+static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t *program,
+                                    uint32_t len, size_t *out_size) {
+    if (out_size) *out_size = 0;
     if (!shared || !shared->execution_profile) return NULL;
-    
+
     vfm_execution_profile_t *profile = shared->execution_profile;
-    
+
     // Analyze current profile data
     detect_hot_paths(profile);
     generate_branch_hints(profile);
@@ -2377,41 +2618,27 @@ static void* adaptive_jit_recompile(vfm_shared_context_t *shared, const uint8_t 
         if (burst_ratio > 0.4) optimize_for_bursts = true;
     }
     
-    // Free old JIT code
-    if (shared->jit_code) {
-        vfm_jit_free(shared->jit_code, shared->jit_code_size);
-        shared->jit_code = NULL;
-    }
-    
-    // Set optimization flags based on packet patterns
+    // Record the packet-pattern-derived optimization flags (advisory hints
+    // only; they may tune prefetch/scheduling but NEVER change instruction
+    // semantics -- see the adaptive compiler, which currently reuses the exact
+    // single-core emitters).
     shared->hints.optimize_for_ipv4 = optimize_for_ipv4;
     shared->hints.optimize_for_ipv6 = optimize_for_ipv6;
     shared->hints.optimize_for_tcp = optimize_for_tcp;
     shared->hints.optimize_for_small_packets = optimize_for_small_packets;
     shared->hints.optimize_for_bursts = optimize_for_bursts;
-    
-    // Adjust prefetch strategy based on packet patterns
+
     if (optimize_for_small_packets) {
-        shared->hints.prefetch_distance = 1; // Less aggressive for small packets
+        shared->hints.prefetch_distance = 1;
     } else if (optimize_for_bursts) {
-        shared->hints.prefetch_distance = 3; // More aggressive for bursts
+        shared->hints.prefetch_distance = 3;
     }
-    
-    // Recompile with profile-guided optimizations
-    #ifdef __aarch64__
-        // ARM64 JIT with profile-guided optimization
-        shared->jit_code = vfm_jit_compile_arm64_adaptive(program, len, profile);
-    #elif defined(__x86_64__)
-        // x86_64 JIT with profile-guided optimization  
-        shared->jit_code = vfm_jit_compile_x86_64_adaptive(program, len, profile);
-    #endif
-    
-    if (shared->jit_code) {
-        shared->jit_code_size = len * 32; // Estimated size
-        shared->opt_level = VFM_JIT_OPT_ADAPTIVE;
-    }
-    
-    return shared->jit_code;
+
+    // Compile into a FRESH page. Do not touch shared->jit_code here.
+    size_t new_size = 0;
+    void *new_code = jit_compile_adaptive_sized(program, len, profile, &new_size);
+    if (out_size) *out_size = new_size;
+    return new_code;
 }
 
 // Check if recompilation is needed based on execution patterns

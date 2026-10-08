@@ -313,6 +313,9 @@ typedef enum {
     VFM_JIT_OPT_AGGRESSIVE = 3    // Maximum optimization
 } vfm_jit_optimization_level_t;
 
+// Forward declaration: each core is backed by a full interpreter-only VM.
+struct vfm_state;
+
 // Phase 3.1: Multi-core VFM architecture
 typedef struct vfm_core_context {
     // Core-local execution state - must be isolated per thread
@@ -340,9 +343,16 @@ typedef struct vfm_core_context {
     // Core-local flow statistics
     vfm_flow_stats_t flow_stats VFM_CACHE_ALIGNED;
     
-    // JIT compiled code for this core
+    // JIT compiled code for this core (vestigial; execution now goes through
+    // the per-core vfm_state_t below, whose cold.jit_code is the live pointer)
     void *jit_code;
-    
+
+    // Phase 3.1 (fixed): the actual execution substrate for this core. A full,
+    // interpreter-only vfm_state_t with its own operand stacks, so there is
+    // zero cross-thread sharing of mutable VM state. The multicore layer is the
+    // SOLE publisher of this VM's cold.jit_code (borrowed from the shared page).
+    struct vfm_state *vm;
+
 } VFM_CACHE_ALIGNED vfm_core_context_t;
 
 // Shared read-only data across all cores
@@ -412,8 +422,26 @@ typedef struct vfm_multicore_state {
     
     // Thread management
     pthread_t *threads;             // Worker threads
-    volatile bool shutdown;         // Shutdown signal
-    
+    bool shutdown;                  // Shutdown signal (read/written only under
+                                    // pool_mutex; volatile is not a C11 barrier)
+
+    // Phase 3.1 (fixed): persistent worker pool with a generation/completed
+    // barrier, replacing the per-batch create-then-join deadlock. All of these
+    // are owned by mc_vm and touched only under pool_mutex (except the threads
+    // array handles themselves).
+    pthread_mutex_t pool_mutex;
+    pthread_cond_t  work_cond;      // owner -> workers: a new generation is ready
+    pthread_cond_t  done_cond;      // workers -> owner: all workers finished
+    uint64_t generation;            // level-triggered batch counter
+    uint32_t completed_count;       // workers finished in the current generation
+    bool     pool_started;          // worker pool created
+    struct worker_context *worker_ctx;   // [num_cores] persistent worker args
+    struct vfm_batch *cur_batch;    // batch currently being processed
+    uint32_t *worker_start;         // [num_cores] per-worker packet range start
+    uint32_t *worker_end;           // [num_cores] per-worker packet range end
+    uint64_t threshold_update_counter;   // was an unsynchronized function-local
+                                          // static shared across all instances
+
     // Performance monitoring across all cores
     struct {
         uint64_t total_packets;     // Total packets processed
@@ -477,6 +505,9 @@ typedef struct vfm_state {
         void *jit_code;             // Compiled native code (NULL if not compiled)
         size_t jit_code_size;       // Size of JIT code for cleanup
         bool jit_enabled;           // Whether to attempt JIT compilation
+        bool jit_borrowed;          // jit_code is owned elsewhere (the multicore
+                                    // shared page): vfm_destroy must NOT free it
+                                    // or release a cache entry for it.
         struct vfm_jit_cache_entry *jit_cache_entry;  // Reference to cached entry
         
         // Platform-specific optimization hints
@@ -880,7 +911,14 @@ int vfm_to_xdp(const uint8_t *vfm_prog, uint32_t vfm_len, char *c_code, size_t c
 // JIT compilation for x86-64
 void* vfm_jit_compile_x86_64(const uint8_t *program, uint32_t len);
 void vfm_jit_free(void *code, size_t size);
-uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len);
+// Canonical JIT calling convention (both arches): the compiled function takes
+// the packet, its length, and explicit pointers to caller-owned 64-bit and
+// 128-bit operand stacks. Passing the stacks explicitly (rather than a VM
+// struct) decouples the compiled page from vfm_state_t / vfm_core_context_t
+// layout, so ONE compiled page is valid and race-free for the single-core VM
+// and for every worker thread's per-core VM at the same time.
+uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len,
+                         uint64_t *stack64, vfm_u128_t *stack128);
 
 // JIT compilation for ARM64
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len);
@@ -1858,8 +1896,10 @@ void vfm_jit_free(void *code, size_t size) {
     // Not implemented
 }
 
-uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len) {
-    return 0;  // Not implemented
+uint64_t vfm_jit_execute(void *jit_code, const uint8_t *packet, uint16_t packet_len,
+                         uint64_t *stack64, vfm_u128_t *stack128) {
+    (void)jit_code; (void)packet; (void)packet_len; (void)stack64; (void)stack128;
+    return 0;  // Not implemented in the single-header build
 }
 
 void* vfm_jit_compile_arm64(const uint8_t *program, uint32_t len) {

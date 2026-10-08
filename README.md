@@ -141,16 +141,46 @@ For easy integration, use the single header version:
 
 Right now, this is very alpha software. You'll note there is no release and no version number. It is written with PacketVelocity in mind, which is also alphaware, so your mileage may vary with other usage. Feel free to submit issues and PRs.
 
-### Experimental / Not Yet Implemented
+### Multi-core adaptive JIT (functional on arm64)
 
-Some capabilities exposed in the public header are **experimental and not production-ready**. Treat them as work-in-progress:
+The `vfm_multicore_*` API is now a working, tested feature:
 
-- **Multi-core batch execution** (`vfm_multicore_*` API): the worker path is a placeholder and does **not** currently run the filter per packet (it returns a fixed "accept" result). Do not rely on it for real filtering yet.
-- **Profile-guided / adaptive JIT** (`VFM_JIT_OPT_ADAPTIVE`, `*_adaptive` compile functions, `vfm_execution_profile_t`): the profiling data structures exist, but adaptive recompilation is not wired into a working execution path.
-- **x86-64 JIT**: present and compiles, but is less complete than the ARM64 backend; the interpreter is the supported execution path on x86-64.
-- **Non-core BPF/XDP export targets**: partial.
+- **Multi-core batch execution** (`vfm_multicore_*`): a persistent worker pool
+  processes each batch across cores and completes via a generation/
+  completed-count barrier (no per-batch thread create/join, no deadlock). Each
+  core is backed by its own interpreter-only `vfm_state_t`, so results are
+  **identical to the single-core interpreter** by construction. Where the shared
+  JIT page compiled, all cores run it concurrently; where it declined, each core
+  falls back to the bounds-checked interpreter. Concurrent `execute_batch` calls
+  on one handle are serialized.
+- **Profile-guided / adaptive JIT** (`VFM_JIT_OPT_ADAPTIVE`, `*_adaptive`,
+  `vfm_execution_profile_t`): adaptive recompilation triggers after the
+  execution threshold and is wired into the batch path with a **compile-into-
+  temp + swap-on-success** lifecycle — the live page is never freed before a
+  successful recompile, and a declined recompile leaves every core on its
+  previous valid page. The adaptive compiler **reuses the single-core emitters**
+  and declines (returns `NULL` → interpreter fallback) for any opcode it cannot
+  prove; it never emits a nop.
+- **ARM64 JIT**: executes correctly via an explicit 4-argument calling
+  convention `fn(packet, len, stack64, stack128)`. The trusted/JIT-accelerated
+  opcode set this pass is **PUSH / ADD / RET**, each gated by a JIT-vs-interpreter
+  oracle; all other opcodes (LD\*, comparisons, the 128-bit NEON ops) decline to
+  the interpreter until they individually pass the oracle. Requires code-signing
+  with `entitlements.plist` (`com.apple.security.cs.allow-jit`); the Makefile
+  falls back to ad-hoc signing when no Developer ID identity is present.
+- **x86-64 JIT**: the single-core backend is self-contained; adaptive delegates
+  to single-core on **all** platforms (x86 profile-guided codegen is deferred to
+  a follow-up with its own oracle tests). x86 is not exercised at runtime on
+  Apple Silicon.
 
-What **is** covered by the runnable test suite (`make test`) today: the single-core bytecode interpreter (arithmetic, stack, packet loads, conditional jumps), static verification, bounds/stack/instruction-limit/division-by-zero safety checks, the flow table, 5-tuple hashing, a real TCP-SYN filter, and ARM64 JIT compilation availability.
+Still partial: **non-core BPF/XDP export targets**.
+
+What the runnable test suite covers today: `make test` runs the single-core
+interpreter unit tests, the JIT **execution** oracle tests (`jit_test`, which now
+executes compiled code and compares to the interpreter), and the multicore
+oracle suite (`test_multicore`). `make test-asan` runs the recompile lifecycle
+under AddressSanitizer with the JIT enabled; `make test-tsan` runs the
+concurrency model under ThreadSanitizer with the JIT disabled.
 
 
 ## Quick Start
@@ -486,7 +516,8 @@ VFM is designed for high throughput through:
 > automated test suite or CI. The repository does not yet ship a benchmark that
 > regenerates them, so treat them as aspirational until a reproducible
 > `make bench` harness lands. The figures assume the single-core interpreter /
-> JIT path, not the experimental multi-core API.
+> JIT path; the multi-core API is functional and tested (`make test`) but has
+> no throughput benchmark yet.
 
 Design targets (Apple M1, simple filters):
 - **VFLisp IPv4 filters**: ~20M packets/second
