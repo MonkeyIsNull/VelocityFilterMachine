@@ -1,6 +1,7 @@
 # Velocity Filter Machine (VFM)
 
 [![CI](https://github.com/MonkeyIsNull/VelocityFilterMachine/actions/workflows/ci.yml/badge.svg)](https://github.com/MonkeyIsNull/VelocityFilterMachine/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/MonkeyIsNull/VelocityFilterMachine)](https://github.com/MonkeyIsNull/VelocityFilterMachine/releases/latest)
 ![tests](https://img.shields.io/badge/tests-passing-brightgreen)
 ![language](https://img.shields.io/badge/language-C-blue)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
