@@ -1,5 +1,16 @@
 # Velocity Filter Machine (VFM)
 
+[![CI](https://github.com/MonkeyIsNull/VelocityFilterMachine/actions/workflows/ci.yml/badge.svg)](https://github.com/MonkeyIsNull/VelocityFilterMachine/actions/workflows/ci.yml)
+![tests](https://img.shields.io/badge/tests-passing-brightgreen)
+![language](https://img.shields.io/badge/language-C-blue)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![status](https://img.shields.io/badge/status-active-brightgreen)
+[![last commit](https://img.shields.io/github/last-commit/MonkeyIsNull/VelocityFilterMachine)](https://github.com/MonkeyIsNull/VelocityFilterMachine/commits/main)
+[![contributions welcome](https://img.shields.io/badge/contributions-welcome-orange)](https://github.com/MonkeyIsNull/VelocityFilterMachine/issues)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![JIT](https://img.shields.io/badge/JIT-arm64%20%2B%20x86--64-orange)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 <img src="vfm.png" alt="vfm" width="80%" />
 
 > P̷̩͗ä̵̩̪́͠ċ̶͓̪͋k̵̟̓͂e̸̢̻̽̎t̵̼̕s̶̝̈́͛ ̴̙̓a̶͎͗r̸̨̛̅e̸̖͛̚ ̶͙͌͠b̸̻̈̒ę̶̗̓t̸͇̰͋t̴̜̑ë̸̡́̇r̶͈̠̆ ̶̢̈́f̷̢͊͘i̷̤̐̐l̶̤̺̐̊t̴̰͗e̵̩̙͝r̵͕̚e̵͈͐d̴͈͝͝ ̶͓͝b̶͕͛̇y̶͖͌ ̴̤̈́a̸̼̺͂͂ ̵͖̾͘V̴̼͋̅í̷̜r̴͖͐t̶̨͗́u̷̻̪̍a̵̪̹͠l̸̳̄ ̴̹̃̋M̸͉̓͐a̶̬̯͒̍c̵̥̞̾h̶̲̥͛̓ì̷̦n̷̘̖̔̏e̴̠̩͌
